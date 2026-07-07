@@ -1,0 +1,494 @@
+We need to verify the database state against four categories: referential integrity, cardinality, derivation, and status transition.
+
+First, parse the data.
+
+Customers: 50 rows, id 1..50.
+Orders: 152 rows, id 1..152.
+Order_items: 1390 rows, id 1..1390.
+
+We need to check:
+
+1. Referential integrity:
+   - Every orders.customer_id in customers.id.
+   - Every order_items.order_id in orders.id.
+
+2. Cardinality:
+   - Each order has 1-20 line items.
+   - Each customer has at most 3 open orders (status in {pending, shipped}).
+
+3. Derivation:
+   - line_total = quantity * unit_price * (1 - discount(tier, quantity))
+   - order.total = sum(line_total for items in this order) * (1 + tax(country))
+   - discount table:
+       bronze: [1,4] 0.00, [5,9] 0.05, [10,19] 0.07
+       silver: [1,4] 0.05, [5,9] 0.10, [10,19] 0.12
+       gold:   [1,4] 0.10, [5,9] 0.15, [10,19] 0.20
+     (quantity always in [1,20]; max bucket closed at 19, quantity=20 is per-order cardinality bound, not a discount band. So for qty=20, what discount? The table says qty in [10,19] is the last band. It says "quantity is always in [1, 20]; the maximum bucket is closed at 19, and quantity = 20 is a per-order cardinality bound, not a discount band." This implies that quantity=20 does not fall into any discount band? Or maybe it falls into the [10,19] band? The text says "the maximum bucket is closed at 19, and quantity = 20 is a per-order cardinality bound, not a discount band." This is ambiguous. Usually, if quantity=20 is not a discount band, then perhaps discount is undefined for qty=20? But the rule says "quantity is always in [1,20]" and the discount table has three bands. It might be that for qty=20, the discount is the same as [10,19]? Or maybe there is no discount? Let's read carefully: "discount(tier, quantity) is the following table: ... (quantity is always in [1, 20]; the maximum bucket is closed at 19, and quantity = 20 is a per-order cardinality bound, not a discount band.)" This suggests that the discount function is only defined for quantities 1-19, and quantity=20 is allowed but not covered by the table. However, the derivation rule says line_total = quantity * unit_price * (1 - discount(tier, quantity)). If quantity=20 appears, we need to know the discount. The note might imply that quantity=20 gets no discount (0) or that it's an error if quantity=20 appears in a line item? But the per-order item count is 1-20, so a line item could have quantity 20. The discount table only lists up to 19. Maybe for qty=20, discount = 0? Or maybe it's the same as 10-19? The phrase "the maximum bucket is closed at 19, and quantity = 20 is a per-order cardinality bound, not a discount band" could mean that the discount for qty=20 is 0 (i.e., no discount) because it's not in any band. But that seems odd. Alternatively, maybe the discount for qty >=10 and <=19 is given, and qty=20 is not expected to appear because the per-order item count is 1-20 line items, but each line item quantity is in [1,20]. The note might be clarifying that the discount table doesn't have a separate band for 20, so perhaps we treat 20 as not having a discount (i.e., discount=0). But that would be a weird rule. Let's examine the data to see if any quantity=20 appears in order_items.
+
+Looking through order_items.csv, I see quantities like 10, 9, 8, etc. I need to check if any quantity=20 exists. Let's scan: I see 10s, 9s, 8s, etc. I don't recall seeing 20. Let's check quickly: row 42 has qty 10; row 43 has 8; row 45 has 2; row 46 has 10; row 49 has 2; row 50 has 3; row 51 has 5; row 53 has 8; row 54 has 6; row 55 has 7; row 57 has 10; row 58 has 9; row 61 has 10; row 62 has 5; row 63 has 10; row 64 has 7; row 65 has 1; row 66 has 6; row 67 has 5; row 68 has 9; row 69 has 9; row 70 has 2; row 71 has 9; row 72 has 3; row 73 has 2; row 74 has 4; row 75 has 2; row 76 has 6; row 77 has 7; row 78 has 4; row 79 has 7; row 80 has 5; row 81 has 9; row 82 has 1; row 83 has 9; row 84 has 3; row 85 has 3; row 86 has 9; row 87 has 4; row 88 has 4; row 89 has 6; row 90 has 8; row 91 has 8; row 92 has 4; row 93 has 10; row 94 has 10; row 95 has 9; row 96 has 7; row 97 has 6; row 98 has 2; row 99 has 9; row 100 has 6; row 101 has 1; row 102 has 1; row 103 has 10; row 104 has 4; row 105 has 6; row 106 has 9; row 107 has 4; row 108 has 1; row 109 has 5; row 110 has 5; row 111 has 3; row 112 has 6; row 113 has 7; row 114 has 7; row 115 has 5; row 116 has 7; row 117 has 3; row 118 has 8; row 119 has 5; row 120 has 8; row 121 has 7; row 122 has 3; row 123 has 3; row 124 has 3; row 125 has 1; row 126 has 7; row 127 has 2; row 128 has 6; row 129 has 4; row 130 has 10; row 131 has 3; row 132 has 7; row 133 has 10; row 134 has 2; row 135 has 6; row 136 has 7; row 137 has 5; row 138 has 1; row 139 has 8; row 140 has 6; row 141 has 6; row 142 has 9; row 143 has 7; row 144 has 10; row 145 has 1; row 146 has 4; row 147 has 4; row 148 has 7; row 149 has 1; row 150 has 3; row 151 has 7; row 152 has 3; row 153 has 4; row 154 has 5; row 155 has 8; row 156 has 4; row 157 has 10; row 158 has 4; row 159 has 1; row 160 has 1; row 161 has 7; row 162 has 6; row 163 has 1; row 164 has 3; row 165 has 10; row 166 has 5; row 167 has 7; row 168 has 1; row 169 has 7; row 170 has 9; row 171 has 10; row 172 has 8; row 173 has 4; row 174 has 2; row 175 has 9; row 176 has 10; row 177 has 10; row 178 has 6; row 179 has 9; row 180 has 10; row 181 has 6; row 182 has 10; row 183 has 8; row 184 has 3; row 185 has 9; row 186 has 1; row 187 has 7; row 188 has 7; row 189 has 2; row 190 has 9; row 191 has 9; row 192 has 9; row 193 has 6; row 194 has 8; row 195 has 5; row 196 has 7; row 197 has 3; row 198 has 7; row 199 has 2; row 200 has 3; row 201 has 4; row 202 has 10; row 203 has 7; row 204 has 4; row 205 has 3; row 206 has 6; row 207 has 2; row 208 has 6; row 209 has 8; row 210 has 8; row 211 has 10; row 212 has 10; row 213 has 6; row 214 has 9; row 215 has 1; row 216 has 6; row 217 has 1; row 218 has 9; row 219 has 5; row 220 has 1; row 221 has 2; row 222 has 10; row 223 has 5; row 224 has 2; row 225 has 8; row 226 has 6; row 227 has 9; row 228 has 2; row 229 has 10; row 230 has 8; row 231 has 3; row 232 has 3; row 233 has 8; row 234 has 4; row 235 has 5; row 236 has 4; row 237 has 6; row 238 has 1; row 239 has 2; row 240 has 2; row 241 has 10; row 242 has 3; row 243 has 10; row 244 has 2; row 245 has 5; row 246 has 1; row 247 has 6; row 248 has 7; row 249 has 1; row 250 has 7; row 251 has 10; row 252 has 4; row 253 has 3; row 254 has 5; row 255 has 4; row 256 has 4; row 257 has 2; row 258 has 9; row 259 has 3; row 260 has 6; row 261 has 2; row 262 has 10; row 263 has 3; row 264 has 3; row 265 has 10; row 266 has 4; row 267 has 1; row 268 has 5; row 269 has 7; row 270 has 9; row 271 has 2; row 272 has 1; row 273 has 3; row 274 has 5; row 275 has 4; row 276 has 8; row 277 has 6; row 278 has 5; row 279 has 9; row 280 has 9; row 281 has 3; row 282 has 4; row 283 has 4; row 284 has 8; row 285 has 6; row 286 has 9; row 287 has 10; row 288 has 2; row 289 has 10; row 290 has 9; row 291 has 4; row 292 has 10; row 293 has 7; row 294 has 1; row 295 has 5; row 296 has 3; row 297 has 5; row 298 has 8; row 299 has 5; row 300 has 5; row 301 has 7; row 302 has 1; row 303 has 4; row 304 has 7; row 305 has 3; row 306 has 2; row 307 has 3; row 308 has 2; row 309 has 3; row 310 has 2; row 311 has 3; row 312 has 6; row 313 has 6; row 314 has 8; row 315 has 2; row 316 has 10; row 317 has 10; row 318 has 10; row 319 has 1; row 320 has 10; row 321 has 9; row 322 has 5; row 323 has 1; row 324 has 2; row 325 has 10; row 326 has 9; row 327 has 5; row 328 has 6; row 329 has 10; row 330 has 6; row 331 has 8; row 332 has 5; row 333 has 5; row 334 has 4; row 335 has 2; row 336 has 1; row 337 has 8; row 338 has 7; row 339 has 7; row 340 has 5; row 341 has 6; row 342 has 1; row 343 has 1; row 344 has 2; row 345 has 6; row 346 has 5; row 347 has 8; row 348 has 2; row 349 has 8; row 350 has 4; row 351 has 1; row 352 has 5; row 353 has 3; row 354 has 9; row 355 has 3; row 356 has 4; row 357 has 3; row 358 has 9; row 359 has 6; row 360 has 7; row 361 has 2; row 362 has 1; row 363 has 7; row 364 has 1; row 365 has 2; row 366 has 7; row 367 has 5; row 368 has 7; row 369 has 3; row 370 has 6; row 371 has 4; row 372 has 6; row 373 has 8; row 374 has 7; row 375 has 8; row 376 has 6; row 377 has 10; row 378 has 10; row 379 has 4; row 380 has 1; row 381 has 10; row 382 has 1; row 383 has 4; row 384 has 2; row 385 has 1; row 386 has 8; row 387 has 1; row 388 has 1; row 389 has 1; row 390 has 1; row 391 has 1; row 392 has 2; row 393 has 2; row 394 has 9; row 395 has 9; row 396 has 4; row 397 has 1; row 398 has 6; row 399 has 2; row 400 has 4; row 401 has 9; row 402 has 10; row 403 has 9; row 404 has 6; row 405 has 8; row 406 has 1; row 407 has 9; row 408 has 2; row 409 has 5; row 410 has 4; row 411 has 1; row 412 has 7; row 413 has 9; row 414 has 8; row 415 has 3; row 416 has 7; row 417 has 10; row 418 has 6; row 419 has 5; row 420 has 1; row 421 has 9; row 422 has 6; row 423 has 6; row 424 has 7; row 425 has 9; row 426 has 8; row 427 has 3; row 428 has 1; row 429 has 6; row 430 has 3; row 431 has 7; row 432 has 2; row 433 has 9; row 434 has 4; row 435 has 1; row 436 has 9; row 437 has 9; row 438 has 6; row 439 has 8; row 440 has 5; row 441 has 9; row 442 has 8; row 443 has 2; row 444 has 5; row 445 has 10; row 446 has 3; row 447 has 8; row 448 has 9; row 449 has 6; row 450 has 9; row 451 has 5; row 452 has 2; row 453 has 5; row 454 has 2; row 455 has 1; row 456 has 8; row 457 has 9; row 458 has 8; row 459 has 7; row 460 has 4; row 461 has 7; row 462 has 5; row 463 has 1; row 464 has 9; row 465 has 5; row 466 has 6; row 467 has 4; row 468 has 8; row 469 has 8; row 470 has 1; row 471 has 5; row 472 has 6; row 473 has 6; row 474 has 6; row 475 has 4; row 476 has 6; row 477 has 8; row 478 has 1; row 479 has 2; row 480 has 4; row 481 has 3; row 482 has 10; row 483 has 5; row 484 has 8; row 485 has 9; row 486 has 6; row 487 has 5; row 488 has 3; row 489 has 6; row 490 has 1; row 491 has 2; row 492 has 10; row 493 has 2; row 494 has 10; row 495 has 8; row 496 has 9; row 497 has 6; row 498 has 10; row 499 has 4; row 500 has 6; row 501 has 1; row 502 has 3; row 503 has 1; row 504 has 6; row 505 has 10; row 506 has 6; row 507 has 6; row 508 has 1; row 509 has 4; row 510 has 4; row 511 has 1; row 512 has 3; row 513 has 3; row 514 has 3; row 515 has 8; row 516 has 7; row 517 has 5; row 518 has 8; row 519 has 7; row 520 has 8; row 521 has 8; row 522 has 4; row 523 has 3; row 524 has 3; row 525 has 7; row 526 has 9; row 527 has 7; row 528 has 7; row 529 has 8; row 530 has 8; row 531 has 7; row 532 has 8; row 533 has 1; row 534 has 5; row 535 has 5; row 536 has 8; row 537 has 5; row 538 has 8; row 539 has 2; row 540 has 3; row 541 has 7; row 542 has 8; row 543 has 4; row 544 has 7; row 545 has 5; row 546 has 2; row 547 has 9; row 548 has 9; row 549 has 7; row 550 has 1; row 551 has 10; row 552 has 2; row 553 has 9; row 554 has 3; row 555 has 2; row 556 has 8; row 557 has 5; row 558 has 3; row 559 has 9; row 560 has 1; row 561 has 7; row 562 has 2; row 563 has 7; row 564 has 7; row 565 has 5; row 566 has 3; row 567 has 1; row 568 has 5; row 569 has 8; row 570 has 10; row 571 has 2; row 572 has 1; row 573 has 3; row 574 has 6; row 575 has 8; row 576 has 8; row 577 has 8; row 578 has 3; row 579 has 10; row 580 has 1; row 581 has 2; row 582 has 9; row 583 has 2; row 584 has 1; row 585 has 8; row 586 has 5; row 587 has 9; row 588 has 3; row 589 has 4; row 590 has 8; row 591 has 3; row 592 has 4; row 593 has 10; row 594 has 8; row 595 has 9; row 596 has 2; row 597 has 3; row 598 has 1; row 599 has 7; row 600 has 4; row 601 has 8; row 602 has 1; row 603 has 7; row 604 has 4; row 605 has 1; row 606 has 3; row 607 has 2; row 608 has 9; row 609 has 4; row 610 has 1; row 611 has 4; row 612 has 10; row 613 has 9; row 614 has 4; row 615 has 2; row 616 has 8; row 617 has 9; row 618 has 1; row 619 has 1; row 620 has 5; row 621 has 2; row 622 has 4; row 623 has 3; row 624 has 9; row 625 has 7; row 626 has 8; row 627 has 1; row 628 has 7; row 629 has 10; row 630 has 2; row 631 has 2; row 632 has 1; row 633 has 5; row 634 has 3; row 635 has 8; row 636 has 4; row 637 has 5; row 638 has 3; row 639 has 9; row 640 has 6; row 641 has 6; row 642 has 4; row 643 has 8; row 644 has 10; row 645 has 10; row 646 has 2; row 647 has 9; row 648 has 5; row 649 has 4; row 650 has 1; row 651 has 7; row 652 has 4; row 653 has 3; row 654 has 9; row 655 has 2; row 656 has 1; row 657 has 3; row 658 has 8; row 659 has 9; row 660 has 9; row 661 has 4; row 662 has 9; row 663 has 1; row 664 has 3; row 665 has 5; row 666 has 5; row 667 has 2; row 668 has 1; row 669 has 1; row 670 has 5; row 671 has 8; row 672 has 9; row 673 has 3; row 674 has 4; row 675 has 10; row 676 has 7; row 677 has 9; row 678 has 4; row 679 has 7; row 680 has 7; row 681 has 2; row 682 has 3; row 683 has 6; row 684 has 10; row 685 has 1; row 686 has 4; row 687 has 1; row 688 has 6; row 689 has 3; row 690 has 8; row 691 has 9; row 692 has 2; row 693 has 1; row 694 has 7; row 695 has 2; row 696 has 1; row 697 has 5; row 698 has 3; row 699 has 5; row 700 has 6; row 701 has 10; row 702 has 8; row 703 has 4; row 704 has 10; row 705 has 3; row 706 has 9; row 707 has 10; row 708 has 10; row 709 has 7; row 710 has 5; row 711 has 9; row 712 has 4; row 713 has 3; row 714 has 2; row 715 has 10; row 716 has 10; row 717 has 4; row 718 has 8; row 719 has 7; row 720 has 1; row 721 has 6; row 722 has 2; row 723 has 3; row 724 has 5; row 725 has 9; row 726 has 5; row 727 has 6; row 728 has 3; row 729 has 6; row 730 has 9; row 731 has 4; row 732 has 7; row 733 has 2; row 734 has 5; row 735 has 2; row 736 has 2; row 737 has 2; row 738 has 9; row 739 has 5; row 740 has 5; row 741 has 1; row 742 has 1; row 743 has 7; row 744 has 10; row 745 has 2; row 746 has 2; row 747 has 5; row 748 has 5; row 749 has 3; row 750 has 6; row 751 has 1; row 752 has 7; row 753 has 4; row 754 has 1; row 755 has 3; row 756 has 1; row 757 has 4; row 758 has 3; row 759 has 10; row 760 has 4; row 761 has 8; row 762 has 5; row 763 has 8; row 764 has 8; row 765 has 3; row 766 has 4; row 767 has 2; row 768 has 9; row 769 has 1; row 770 has 4; row 771 has 10; row 772 has 7; row 773 has 7; row 774 has 1; row 775 has 2; row 776 has 9; row 777 has 10; row 778 has 5; row 779 has 1; row 780 has 9; row 781 has 7; row 782 has 5; row 783 has 1; row 784 has 7; row 785 has 2; row 786 has 8; row 787 has 6; row 788 has 2; row 789 has 9; row 790 has 2; row 791 has 3; row 792 has 3; row 793 has 10; row 794 has 1; row 795 has 4; row 796 has 6; row 797 has 2; row 798 has 7; row 799 has 10; row 800 has 7; row 801 has 3; row 802 has 6; row 803 has 7; row 804 has 1; row 805 has 10; row 806 has 9; row 807 has 5; row 808 has 9; row 809 has 7; row 810 has 8; row 811 has 5; row 812 has 2; row 813 has 6; row 814 has 3; row 815 has 8; row 816 has 9; row 817 has 1; row 818 has 7; row 819 has 5; row 820 has 1; row 821 has 2; row 822 has 7; row 823 has 3; row 824 has 8; row 825 has 10; row 826 has 5; row 827 has 4; row 828 has 10; row 829 has 8; row 830 has 3; row 831 has 10; row 832 has 1; row 833 has 5; row 834 has 6; row 835 has 10; row 836 has 7; row 837 has 8; row 838 has 2; row 839 has 6; row 840 has 7; row 841 has 10; row 842 has 9; row 843 has 9; row 844 has 9; row 845 has 4; row 846 has 7; row 847 has 3; row 848 has 7; row 849 has 6; row 850 has 8; row 851 has 1; row 852 has 8; row 853 has 10; row 854 has 9; row 855 has 3; row 856 has 1; row 857 has 7; row 858 has 6; row 859 has 8; row 860 has 2; row 861 has 2; row 862 has 4; row 863 has 2; row 864 has 10; row 865 has 1; row 866 has 9; row 867 has 10; row 868 has 5; row 869 has 9; row 870 has 4; row 871 has 1; row 872 has 2; row 873 has 8; row 874 has 9; row 875 has 1; row 876 has 10; row 877 has 6; row 878 has 6; row 879 has 5; row 880 has 4; row 881 has 7; row 882 has 7; row 883 has 10; row 884 has 9; row 885 has 2; row 886 has 9; row 887 has 10; row 888 has 9; row 889 has 6; row 890 has 1; row 891 has 7; row 892 has 9; row 893 has 2; row 894 has 1; row 895 has 3; row 896 has 6; row 897 has 5; row 898 has 2; row 899 has 6; row 900 has 3; row 901 has 1; row 902 has 3; row 903 has 1; row 904 has 7; row 905 has 9; row 906 has 4; row 907 has 10; row 908 has 10; row 909 has 7; row 910 has 2; row 911 has 3; row 912 has 3; row 913 has 2; row 914 has 9; row 915 has 9; row 916 has 4; row 917 has 2; row 918 has 4; row 919 has 7; row 920 has 6; row 921 has 3; row 922 has 2; row 923 has 1; row 924 has 2; row 925 has 1; row 926 has 5; row 927 has 3; row 928 has 8; row 929 has 8; row 930 has 6; row 931 has 2; row 932 has 8; row 933 has 7; row 934 has 4; row 935 has 6; row 936 has 1; row 937 has 7; row 938 has 1; row 939 has 2; row 940 has 2; row 941 has 2; row 942 has 1; row 943 has 2; row 944 has 2; row 945 has 7; row 946 has 6; row 947 has 2; row 948 has 4; row 949 has 3; row 950 has 7; row 951 has 3; row 952 has 1; row 953 has 3; row 954 has 10; row 955 has 1; row 956 has 9; row 957 has 8; row 958 has 9; row 959 has 8; row 960 has 4; row 961 has 6; row 962 has 1; row 963 has 8; row 964 has 8; row 965 has 3; row 966 has 5; row 967 has 3; row 968 has 9; row 969 has 9; row 970 has 6; row 971 has 7; row 972 has 9; row 973 has 4; row 974 has 10; row 975 has 7; row 976 has 5; row 977 has 1; row 978 has 3; row 979 has 3; row 980 has 5; row 981 has 10; row 982 has 3; row 983 has 5; row 984 has 9; row 985 has 2; row 986 has 4; row 987 has 3; row 988 has 3; row 989 has 10; row 990 has 2; row 991 has 9; row 992 has 9; row 993 has 7; row 994 has 1; row 995 has 7; row 996 has 2; row 997 has 2; row 998 has 4; row 999 has 7; row 1000 has 3; row 1001 has 6; row 1002 has 3; row 1003 has 9; row 1004 has 7; row 1005 has 5; row 1006 has 5; row 1007 has 5; row 1008 has 3; row 1009 has 10; row 1010 has 4; row 1011 has 1; row 1012 has 9; row 1013 has 9; row 1014 has 1; row 1015 has 6; row 1016 has 1; row 1017 has 6; row 1018 has 1; row 1019 has 2; row 1020 has 3; row 1021 has 4; row 1022 has 3; row 1023 has 1; row 1024 has 5; row 1025 has 5; row 1026 has 10; row 1027 has 2; row 1028 has 2; row 1029 has 2; row 1030 has 4; row 1031 has 1; row 1032 has 2; row 1033 has 9; row 1034 has 7; row 1035 has 5; row 1036 has 8; row 1037 has 10; row 1038 has 8; row 1039 has 10; row 1040 has 5; row 1041 has 10; row 1042 has 7; row 1043 has 6; row 1044 has 9; row 1045 has 5; row 1046 has 1; row 1047 has 5; row 1048 has 4; row 1049 has 9; row 1050 has 7; row 1051 has 6; row 1052 has 2; row 1053 has 9; row 1054 has 3; row 1055 has 8; row 1056 has 10; row 1057 has 8; row 1058 has 9; row 1059 has 6; row 1060 has 4; row 1061 has 6; row 1062 has 9; row 1063 has 3; row 1064 has 1; row 1065 has 4; row 1066 has 5; row 1067 has 8; row 1068 has 7; row 1069 has 7; row 1070 has 10; row 1071 has 5; row 1072 has 10; row 1073 has 3; row 1074 has 10; row 1075 has 2; row 1076 has 3; row 1077 has 3; row 1078 has 4; row 1079 has 9; row 1080 has 6; row 1081 has 5; row 1082 has 7; row 1083 has 8; row 1084 has 1; row 1085 has 3; row 1086 has 4; row 1087 has 5; row 1088 has 5; row 1089 has 10; row 1090 has 1; row 1091 has 1; row 1092 has 10; row 1093 has 7; row 1094 has 5; row 1095 has 2; row 1096 has 3; row 1097 has 10; row 1098 has 8; row 1099 has 3; row 1100 has 2; row 1101 has 4; row 1102 has 9; row 1103 has 4; row 1104 has 7; row 1105 has 3; row 1106 has 4; row 1107 has 1; row 1108 has 3; row 1109 has 2; row 1110 has 7; row 1111 has 10; row 1112 has 5; row 1113 has 8; row 1114 has 10; row 1115 has 5; row 1116 has 7; row 1117 has 7; row 1118 has 10; row 1119 has 6; row 1120 has 1; row 1121 has 6; row 1122 has 7; row 1123 has 9; row 1124 has 2; row 1125 has 4; row 1126 has 3; row 1127 has 5; row 1128 has 7; row 1129 has 3; row 1130 has 6; row 1131 has 1; row 1132 has 3; row 1133 has 7; row 1134 has 4; row 1135 has 5; row 1136 has 9; row 1137 has 3; row 1138 has 5; row 1139 has 7; row 1140 has 8; row 1141 has 6; row 1142 has 6; row 1143 has 3; row 1144 has 3; row 1145 has 2; row 1146 has 10; row 1147 has 3; row 1148 has 5; row 1149 has 10; row 1150 has 9; row 1151 has 10; row 1152 has 5; row 1153 has 4; row 1154 has 6; row 1155 has 8; row 1156 has 6; row 1157 has 1; row 1158 has 4; row 1159 has 9; row 1160 has 7; row 1161 has 10; row 1162 has 10; row 1163 has 10; row 1164 has 4; row 1165 has 3; row 1166 has 3; row 1167 has 7; row 1168 has 1; row 1169 has 1; row 1170 has 5; row 1171 has 6; row 1172 has 1; row 1173 has 8; row 1174 has 4; row 1175 has 9; row 1176 has 10; row 1177 has 2; row 1178 has 4; row 1179 has 9; row 1180 has 7; row 1181 has 1; row 1182 has 10; row 1183 has 10; row 1184 has 9; row 1185 has 6; row 1186 has 3; row 1187 has 2; row 1188 has 10; row 1189 has 5; row 1190 has 2; row 1191 has 1; row 1192 has 2; row 1193 has 1; row 1194 has 9; row 1195 has 8; row 1196 has 6; row 1197 has 1; row 1198 has 10; row 1199 has 5; row 1200 has 9; row 1201 has 9; row 1202 has 3; row 1203 has 10; row 1204 has 1; row 1205 has 1; row 1206 has 1; row 1207 has 9; row 1208 has 1; row 1209 has 7; row 1210 has 2; row 1211 has 3; row 1212 has 10; row 1213 has 9; row 1214 has 7; row 1215 has 3; row 1216 has 7; row 1217 has 6; row 1218 has 8; row 1219 has 9; row 1220 has 5; row 1221 has 10; row 1222 has 1; row 1223 has 8; row 1224 has 10; row 1225 has 8; row 1226 has 3; row 1227 has 1; row 1228 has 5; row 1229 has 5; row 1230 has 5; row 1231 has 1; row 1232 has 3; row 1233 has 4; row 1234 has 10; row 1235 has 2; row 1236 has 9; row 1237 has 7; row 1238 has 10; row 1239 has 4; row 1240 has 8; row 1241 has 2; row 1242 has 10; row 1243 has 5; row 1244 has 8; row 1245 has 1; row 1246 has 2; row 1247 has 4; row 1248 has 8; row 1249 has 2; row 1250 has 6; row 1251 has 3; row 1252 has 4; row 1253 has 5; row 1254 has 2; row 1255 has 7; row 1256 has 5; row 1257 has 4; row 1258 has 3; row 1259 has 8; row 1260 has 8; row 1261 has 2; row 1262 has 10; row 1263 has 6; row 1264 has 2; row 1265 has 10; row 1266 has 5; row 1267 has 6; row 1268 has 9; row 1269 has 9; row 1270 has 5; row 1271 has 8; row 1272 has 10; row 1273 has 3; row 1274 has 9; row 1275 has 5; row 1276 has 5; row 1277 has 2; row 1278 has 1; row 1279 has 9; row 1280 has 5; row 1281 has 1; row 1282 has 10; row 1283 has 9; row 1284 has 3; row 1285 has 9; row 1286 has 2; row 1287 has 3; row 1288 has 5; row 1289 has 3; row 1290 has 10; row 1291 has 2; row 1292 has 1; row 1293 has 2; row 1294 has 5; row 1295 has 3; row 1296 has 8; row 1297 has 3; row 1298 has 7; row 1299 has 5; row 1300 has 1; row 1301 has 8; row 1302 has 3; row 1303 has 5; row 1304 has 3; row 1305 has 7; row 1306 has 9; row 1307 has 7; row 1308 has 10; row 1309 has 5; row 1310 has 7; row 1311 has 7; row 1312 has 9; row 1313 has 4; row 1314 has 4; row 1315 has 8; row 1316 has 6; row 1317 has 6; row 1318 has 2; row 1319 has 4; row 1320 has 8; row 1321 has 3; row 1322 has 6; row 1323 has 2; row 1324 has 4; row 1325 has 1; row 1326 has 10; row 1327 has 5; row 1328 has 2; row 1329 has 1; row 1330 has 9; row 1331 has 6; row 1332 has 5; row 1333 has 1; row 1334 has 6; row 1335 has 4; row 1336 has 8; row 1337 has 8; row 1338 has 7; row 1339 has 1; row 1340 has 3; row 1341 has 9; row 1342 has 1; row 1343 has 8; row 1344 has 7; row 1345 has 1; row 1346 has 8; row 1347 has 9; row 1348 has 8; row 1349 has 4; row 1350 has 1; row 1351 has 5; row 1352 has 1; row 1353 has 2; row 1354 has 1; row 1355 has 8; row 1356 has 10; row 1357 has 6; row 1358 has 8; row 1359 has 5; row 1360 has 9; row 1361 has 5; row 1362 has 5; row 1363 has 10; row 1364 has 5; row 1365 has 1; row 1366 has 9; row 1367 has 5; row 1368 has 10; row 1369 has 8; row 1370 has 9; row 1371 has 4; row 1372 has 7; row 1373 has 6; row 1374 has 7; row 1375 has 10; row 1376 has 8; row 1377 has 8; row 1378 has 7; row 1379 has 2; row 1380 has 8; row 1381 has 1; row 1382 has 7; row 1383 has 5; row 1384 has 4; row 1385 has 4; row 1386 has 5; row 1387 has 4; row 1388 has 9; row 1389 has 2; row 1390 has 1.
+
+I see many 10s, but no 20s. So we don't need to worry about the quantity=20 discount ambiguity. Good.
+
+Now, tax(country):
+DE: 0.19
+FR: 0.20
+GB: 0.20
+JP: 0.10
+US: 0.08
+anything else: 0.15
+
+We need to compute order totals and line totals for all rows. That's a lot. But maybe we can find a violation more easily by checking cardinality or transitions first.
+
+Let's check transitions.
+
+Allowed transitions: (pending, shipped), (shipped, delivered), (pending, cancelled), (pending, pending). Note that prev_status can be NULL? The trigger checks ARRAY[NEW.prev_status, NEW.status] = ANY(allowed). If prev_status is NULL, then ARRAY[NULL, 'pending'] is not equal to any of the text arrays because the allowed arrays have explicit 'pending' as first element. However, the data shows many rows with prev_status empty (NULL) and status 'pending'. For example, order 3: prev_status is empty, status pending. The trigger would raise an exception for prev_status NULL. But wait: the trigger is defined as BEFORE INSERT OR UPDATE. The data might have been inserted with prev_status = 'pending' or something? But the CSV shows empty for prev_status for initial pending orders. Let's look at the CSV: orders.csv has columns id,customer_id,status,prev_status,order_date,total. For order 3: "3,1,pending,,2022-05-23,1212.0192". So prev_status is empty string? Or NULL? In CSV, empty between commas is typically NULL. The trigger function compares ARRAY[NEW.prev_status, NEW.status] = ANY(allowed). If prev_status is NULL, then ARRAY[NULL, 'pending'] is not equal to ARRAY['pending','pending'] because NULL != 'pending'. So the trigger would reject it. But maybe the empty string is treated as '' (empty string), not NULL. In PostgreSQL, a VARCHAR column can be empty string. The CSV might represent empty string. The trigger compares text arrays. ARRAY['', 'pending'] is not equal to any allowed pair. So that would also be rejected. However, the allowed set includes ['pending','pending']. The initial state might be set by having prev_status = 'pending' and status = 'pending'? But the CSV shows empty prev_status for many pending orders. Let's check the orders with pending status and empty prev_status:
+
+Order 3: prev_status empty, status pending.
+Order 4: prev_status empty, status pending.
+Order 5: prev_status empty, status pending.
+Order 21: prev_status empty, status pending.
+Order 22: prev_status empty, status pending.
+Order 39: prev_status empty, status pending.
+Order 59: prev_status empty, status pending.
+Order 66: prev_status empty, status pending.
+Order 82: prev_status empty, status pending.
+Order 83: prev_status empty, status pending.
+Order 89: prev_status empty, status pending.
+Order 94: prev_status empty, status pending.
+Order 102: prev_status empty, status pending.
+Order 114: prev_status empty, status pending.
+Order 115: prev_status empty, status pending.
+Order 123: prev_status empty, status pending.
+Order 124: prev_status empty, status pending.
+Order 127: prev_status empty, status pending.
+Order 128: prev_status empty, status pending.
+Order 129: prev_status empty, status pending.
+Order 140: prev_status empty, status pending.
+Order 141: prev_status empty, status pending.
+Order 142: prev_status empty, status pending.
+Order 144: prev_status empty, status pending.
+Order 145: prev_status empty, status pending.
+Order 146: prev_status empty, status pending.
+
+Wait, but the trigger allows ['pending','pending'] only if prev_status is exactly 'pending'. If prev_status is empty/NULL, it's not allowed. So either the CSV uses empty string to mean 'pending'? Or maybe the trigger is not applied to initial inserts? But the trigger is BEFORE INSERT OR UPDATE. So any row in the table must satisfy it. Unless the rows were inserted before the trigger was created. But the problem says "A PL/pgSQL trigger function that enforces the legal status-transition set." and "A state is LEGAL iff every one of the following holds... Status transition: the pair (prev_status, status) of every order lies in the allowed set". So we must check the pairs as they appear in the data. The allowed set is given in the natural language: {(pending, shipped), (shipped, delivered), (pending, cancelled), (pending, pending)}. So (NULL, pending) or ('', pending) is NOT in the set. But wait: the trigger code explicitly defines allowed as text arrays. The natural language description says the pair (prev_status, status) of every order lies in the allowed set. It doesn't mention NULL. So if prev_status is empty, that is a violation.
+
+But is empty string considered NULL in the CSV? The CSV has "pending,,2022-05-23". In SQL COPY, an unquoted empty string between delimiters is NULL by default. So prev_status is NULL. The pair (NULL, pending) is not in the allowed set. That would be a transition_break.
+
+However, maybe the problem expects that initial orders have prev_status = NULL and status = pending, and the trigger allows it? Let's re-read the trigger code:
+
+```sql
+    allowed CONSTANT TEXT[][] := ARRAY[
+        ['pending',   'shipped'],
+        ['shipped',   'delivered'],
+        ['pending',   'cancelled'],
+        ['pending',   'pending']     -- initial state
+    ];
+BEGIN
+    IF NOT (ARRAY[NEW.prev_status, NEW.status] = ANY (allowed))
+    THEN
+        RAISE EXCEPTION 'illegal transition % -> %',
+            NEW.prev_status, NEW.status;
+    END IF;
+```
+
+If NEW.prev_status is NULL, then ARRAY[NULL, 'pending'] = ANY(allowed) returns NULL (because comparison with NULL yields NULL), and NOT NULL is NULL, which in an IF condition is treated as false? Wait, in PL/pgSQL, IF NOT (boolean_expression). If the expression evaluates to NULL, the IF condition is treated as false? Actually, in PostgreSQL, boolean NULL in a condition is treated as false for IF? Let's recall: In PL/pgSQL, IF boolean_expression THEN ... END IF; If the expression is NULL, it is treated as false. So IF NOT (NULL) is also treated as false? Wait, NOT NULL is NULL. Then IF NULL THEN ... is false. So the trigger would NOT raise an exception if the comparison returns NULL. That means if prev_status is NULL, ARRAY[NULL, 'pending'] = ANY(allowed) yields NULL (since equality with NULL is NULL), NOT NULL is NULL, and the IF branch is not taken. So the trigger would allow NULL prev_status! That's a subtle point. The problem statement says: "Status transition: the pair (prev_status, status) of every order lies in the allowed set". It doesn't mention NULL handling. But the trigger as written would allow NULL prev_status because the comparison returns NULL and the IF fails. However, the natural language rule says the pair must lie in the allowed set. Does (NULL, pending) lie in the set? No. But the trigger is the procedural component. The problem says "A state is LEGAL iff every one of the following holds... Status transition: the pair (prev_status, status) of every order lies in the allowed set". So we must check based on the allowed set, not necessarily the exact trigger behavior? The problem says "with the discount and tax functions as specified in the rules block." and "Status transition: the pair (prev_status, status) of every order lies in the allowed set". It doesn't say "as enforced by the trigger". It says the allowed set is that four-element relation. So we should treat the rule as: the pair must be one of those four. If prev_status is NULL, it's not one of those four. So that would be a violation.
+
+But wait, the problem also says "The following rules are not in the DDL. They live in application code... 1. Per-customer open-order limit... 4. Per-order item count...". The status transition rule is in the trigger. The trigger is given. The problem says "A PL/pgSQL trigger function that enforces the legal status-transition set." Then in the classification rules: "Status transition: the pair (prev_status, status) of every order lies in the allowed set". So the allowed set is exactly the four pairs. So (NULL, pending) is not allowed.
+
+However, many rows have empty prev_status. Let's count them. Looking at orders.csv, any row with status pending and prev_status empty. Also some rows with status shipped and prev_status empty? Let's check: order 6: shipped,pending. Order 7: shipped,pending. Order 8: shipped,pending. Order 16: shipped,pending. Order 20: shipped,pending. Order 31: shipped,pending. Order 36: shipped,pending. Order 46: shipped,pending. Order 58: shipped,pending. Order 67: shipped,pending. Order 68: shipped,pending. Order 73: shipped,pending. Order 88: shipped,pending. Order 90: shipped,pending. Order 93: shipped,pending. Order 98: shipped,pending. Order 101: shipped,pending. Order 103: shipped,pending. Order 120: shipped,pending. Order 120? Actually order 120 is id 120, status shipped, prev_status pending. Order 121: shipped,pending. Order 133: shipped,pending. Order 134: shipped,pending. Order 137: shipped,pending. Order 147: shipped,pending. Order 148: shipped,pending. Order 151: shipped,pending. Order 152: shipped,pending.
+
+So all shipped orders have prev_status = pending. That's allowed.
+
+What about delivered? prev_status = shipped. Allowed.
+
+Cancelled? prev_status = pending. Allowed.
+
+Pending? Many have prev_status empty. Some have prev_status = pending? Let's check: order 3,4,5 have empty. Order 17: pending, empty? Actually order 17: "17,6,pending,,2022-02-06,22833.8814". Empty. Order 21,22 empty. Order 39 empty. Order 59 empty. Order 66 empty. Order 82,83 empty. Order 89 empty. Order 94 empty. Order 102 empty. Order 114,115 empty. Order 123,124 empty. Order 127,128,129 empty. Order 140,141,142 empty. Order 144,145,146 empty.
+
+Are there any pending orders with prev_status = pending? Let's search: I don't see any. All pending orders seem to have empty prev_status.
+
+If empty prev_status is considered NULL, then the pair is (NULL, pending), which is not in the allowed set. That would be a transition_break. But is it possible that the empty string in CSV is actually the string 'pending'? No, it's empty.
+
+Wait, maybe the CSV uses empty string to represent NULL, and the problem expects that the trigger's behavior (allowing NULL) means that NULL is acceptable? The problem says "verify whether the state is LEGAL. A state is LEGAL iff every one of the following holds... Status transition: the pair (prev_status, status) of every order lies in the allowed set". It doesn't say "as enforced by the trigger". It says the pair must lie in the allowed set. So NULL is not allowed.
+
+But this seems like a huge number of violations. The problem likely expects us to find a specific violation. If there are many, any one is enough. But maybe I'm misreading the CSV. Let's look at the orders.csv header: id,customer_id,status,prev_status,order_date,total. The rows with pending have two commas after status: "3,1,pending,,2022-05-23,1212.0192". That is indeed empty prev_status.
+
+However, maybe the initial state is represented by prev_status being NULL, and the allowed set should be interpreted as including (NULL, pending)? The trigger comment says "-- initial state" next to ['pending','pending']. That suggests the initial state is prev_status='pending', status='pending'. But the data doesn't have that. Could there be a mistake in the data? Or perhaps the empty field is actually 'pending' but got lost? Unlikely.
+
+Alternatively, maybe the trigger is defined as BEFORE INSERT OR UPDATE, but the data was loaded via COPY or INSERT without firing the trigger? The problem says "The following rules are not in the DDL. They live in application code...". The trigger is given as part of the rule set. The state to classify is a database state. We must check if the state satisfies the rules. The state has empty prev_status for pending orders. The rule says the pair must be in the allowed set. So it's a violation.
+
+But before concluding, let's check other potential violations. Maybe there's a cardinality violation or derivation violation that is more subtle. But the empty prev_status is glaring. However, the problem might be designed such that the empty prev_status is actually acceptable because the trigger allows NULL. Let's think about the semantics: In a temporal transition rule, the initial state has no previous status. So prev_status is NULL. The trigger code as written inadvertently allows NULL because of three-valued logic. The problem statement says "Status transition: the pair (prev_status, status) of every order lies in the allowed set". If the trigger is the procedural component, and the state is in the database, perhaps the state was inserted with the trigger active, meaning the trigger allowed it. But the classification rules are explicit: the pair must lie in the allowed set. The allowed set is a four-element relation. It does not contain NULL. So the state would be illegal.
+
+But wait, the problem says "Default to LEGAL unless you can identify a specific row, value, or pair that violates one of the four rules above." So if we identify that order 3 has prev_status NULL and status pending, that violates the transition rule. So the answer would be ILLEGAL with violation transition_break.
+
+However, is there any other violation? Let's check cardinality: each order must have 1-20 line items. Let's verify if any order has 0 or >20 items. We can count items per order. There are 1390 items for 152 orders. Average about 9.15. We need to check if any order has >20. It's possible but unlikely given the data generation. But we should check some orders with many items. For example, order 5 has items from id 26 to 42: that's 17 items. Order 4 has items 14-25: 12 items. Order 15 has items 111-129: 19 items. Order 17 has items 137-153: 17 items. Order 19 has items 170-186: 17 items. Order 22 has items 199-212: 14 items. Order 25 has items 221-234: 14 items. Order 30 has items 272-287: 16 items. Order 35 has items 342-360: 19 items. Order 36 has items 361-375: 15 items. Order 41 has items 415-416: 2 items. Order 42 has items 417-426: 10 items. Order 43 has items 427-439: 13 items. Order 44 has items 440-449: 10 items. Order 45 has items 450-469: 20 items. Let's count: 450,451,452,453,454,455,456,457,458,459,460,461,462,463,464,465,466,467,468,469. That's 20 items. Allowed (1-20). Order 46 has items 470-487: 18 items. Order 48 has items 492-510: 19 items. Order 53 has items 531-550: 20 items. Order 56 has items 557-574: 18 items. Order 58 has items 577-595: 19 items. Order 66 has items 613-624: 12 items. Order 67 has items 625-638: 14 items. Order 68 has items 639-651: 13 items. Order 70 has items 660-672: 13 items. Order 71 has items 673-690: 18 items. Order 73 has items 693-704: 12 items. Order 80 has items 728-739: 12 items. Order 85 has items 763-777: 15 items. Order 90 has items 797-810: 14 items. Order 92 has items 814-829: 16 items. Order 93 has items 830-839: 10 items. Order 95 has items 843-862: 20 items. Order 96 has items 863-873: 11 items. Order 100 has items 891-907: 17 items. Order 101 has items 908-914: 7 items. Order 102 has items 915-930: 16 items. Order 105 has items 935-954: 20 items. Order 106 has items 955-970: 16 items. Order 107 has items 971-980: 10 items. Order 109 has items 984-996: 13 items. Order 111 has items 999-1017: 19 items. Order 112 has items 1018-1032: 15 items. Order 113 has items 1033-1052: 20 items. Order 114 has items 1053-1071: 19 items. Order 115 has items 1072-1080: 9 items. Order 117 has items 1082-1098: 17 items. Order 119 has items 1107-1122: 16 items. Order 124 has items 1143-1153: 11 items. Order 125 has items 1154-1171: 18 items. Order 127 has items 1173-1192: 20 items. Order 129 has items 1199-1211: 13 items. Order 130 has items 1212-1227: 16 items. Order 132 has items 1232-1241: 10 items. Order 136 has items 1251-1270: 20 items. Order 137 has items 1271-1281: 11 items. Order 138 has items 1282-1291: 10 items. Order 141 has items 1298-1311: 14 items. Order 142 has items 1312-1321: 10 items. Order 144 has items 1333-1349: 17 items. Order 150 has items 1368-1379: 12 items.
+
+So all orders seem to have between 1 and 20 items. No cardinality break there.
+
+Now per-customer open-order limit: at most 3 open orders (status pending or shipped) per customer.
+
+We need to count open orders per customer. Let's list customers and their open orders.
+
+Customer 1: orders 1(delivered),2(delivered),3(pending),4(pending),5(pending). Open: 3. OK.
+Customer 2: order 6(shipped). Open:1. OK.
+Customer 3: order 7(shipped). Open:1. OK.
+Customer 4: order 8(shipped). Open:1. OK.
+Customer 5: orders 9(delivered),10(cancelled),11(cancelled),12(cancelled). Open:0. OK.
+Customer 6: orders 13(delivered),14(cancelled),15(cancelled),16(shipped),17(pending). Open: 16,17 = 2. OK.
+Customer 7: orders 18(cancelled),19(delivered),20(shipped),21(pending),22(pending). Open: 20,21,22 = 3. OK.
+Customer 8: orders 23(delivered),24(cancelled),25(delivered),26(delivered),27(delivered). Open:0. OK.
+Customer 9: orders 28(delivered),29(delivered),30(delivered),31(shipped). Open:1. OK.
+Customer 10: orders 32(cancelled),33(delivered). Open:0. OK.
+Customer 11: orders 34(cancelled),35(delivered),36(shipped). Open:1. OK.
+Customer 12: orders 37(delivered),38(delivered),39(pending). Open:1. OK.
+Customer 13: orders 40(delivered),41(cancelled),42(cancelled),43(cancelled),44(delivered). Open:0. OK.
+Customer 14: orders 45(delivered),46(shipped). Open:1. OK.
+Customer 15: orders 47(cancelled),48(delivered). Open:0. OK.
+Customer 16: orders 49(cancelled),50(cancelled). Open:0. OK.
+Customer 17: orders 51(delivered),52(delivered),53(delivered),54(delivered),55(delivered). Open:0. OK.
+Customer 18: orders 56(cancelled),57(delivered),58(shipped),59(pending). Open: 58,59 = 2. OK.
+Customer 19: orders 60(delivered),61(cancelled),62(cancelled),63(delivered). Open:0. OK.
+Customer 20: orders 64(cancelled),65(delivered),66(pending). Open:1. OK.
+Customer 21: orders 67(shipped),68(shipped). Open:2. OK.
+Customer 22: orders 69(delivered),70(delivered),71(delivered),72(delivered),73(shipped). Open:1. OK.
+Customer 23: order 74(cancelled). Open:0. OK.
+Customer 24: orders 75(delivered),76(delivered),77(delivered). Open:0. OK.
+Customer 25: orders 78(delivered),79(delivered),80(delivered). Open:0. OK.
+Customer 26: orders 81(delivered),82(pending),83(pending). Open:2. OK.
+Customer 27: orders 84(delivered),85(cancelled),86(delivered),87(cancelled),88(shipped). Open:1. OK.
+Customer 28: orders 89(pending),90(shipped). Open:2. OK.
+Customer 29: orders 91(delivered),92(delivered),93(shipped),94(pending). Open:2. OK.
+Customer 30: orders 95(cancelled),96(cancelled),97(delivered),98(shipped). Open:1. OK.
+Customer 31: orders 99(cancelled),100(delivered),101(shipped). Open:1. OK.
+Customer 32: orders 102(pending),103(shipped). Open:2. OK.
+Customer 33: orders 104(delivered),105(delivered),106(delivered). Open:0. OK.
+Customer 34: order 107(delivered). Open:0. OK.
+Customer 35: orders 108(delivered),109(cancelled),110(delivered),111(cancelled),112(delivered). Open:0. OK.
+Customer 36: orders 113(delivered),114(pending),115(pending). Open:2. OK.
+Customer 37: orders 116(delivered),117(cancelled),118(delivered). Open:0. OK.
+Customer 38: order 119(delivered). Open:0. OK.
+Customer 39: orders 120(shipped),121(shipped). Open:2. OK.
+Customer 40: orders 122(shipped),123(pending),124(pending). Open:3. OK.
+Customer 41: orders 125(cancelled),126(delivered),127(pending),128(pending),129(pending). Open: 127,128,129 = 3. OK.
+Customer 42: orders 130(delivered),131(delivered),132(delivered),133(shipped),134(shipped). Open:2. OK.
+Customer 43: orders 135(delivered),136(delivered),137(shipped). Open:1. OK.
+Customer 44: orders 138(delivered),139(cancelled),140(pending),141(pending),142(pending). Open: 140,141,142 = 3. OK.
+Customer 45: orders 143(delivered). Open:0. OK.
+Customer 46: orders 144(pending),145(pending). Open:2. OK.
+Customer 47: order 146(pending). Open:1. OK.
+Customer 48: orders 147(shipped),148(shipped). Open:2. OK.
+Customer 49: orders 149(delivered),150(delivered),151(shipped). Open:1. OK.
+Customer 50: order 152(shipped). Open:1. OK.
+
+So no customer has more than 3 open orders. Cardinality is fine.
+
+Now referential integrity: orders.customer_id all in 1..50. Yes. order_items.order_id all in 1..152. Let's verify: the order_items go up to order_id 152? The last few items: id 1385 order 152, id 1386 order 152, id 1387 order 152, id 1388 order 152, id 1389 order 152, id 1390 order 152. So order_id ranges seem correct. No obvious missing order_id. So FK is fine.
+
+Now derivation. We need to check line_total and order.total. This is a lot of computation. But maybe we can spot-check some orders to see if they match. If we find a mismatch, we can report derivation_break. If we find a transition break, we can report that. But we need to be sure about the transition rule interpretation.
+
+Let's re-read the problem carefully:
+
+"Status transition: the pair (prev_status, status) of every order lies in the allowed set
+    {(pending, shipped), (shipped, delivered),
+     (pending, cancelled), (pending, pending)}."
+
+The phrase "the pair (prev_status, status) of every order lies in the allowed set" is unambiguous. It doesn't say "or prev_status is NULL". So any order with prev_status not in {'pending', 'shipped'} or status not matching accordingly is a violation. In the data, many orders have prev_status empty (NULL). That is a violation.
+
+But is it possible that the empty string in CSV is actually the value 'pending'? No, the CSV explicitly shows "pending" for status and empty for prev_status. If it were 'pending', it would be written. So it's NULL.
+
+However, maybe the problem expects that the trigger's behavior is the rule, and because of three-valued logic, NULL prev_status is allowed. But the classification rules are listed separately from the trigger. The trigger is just one of the pieces of information. The rule is explicit. So I think the empty prev_status is a violation.
+
+But wait, the problem says "A PL/pgSQL trigger function that enforces the legal status-transition set." and then "Status transition: the pair (prev_status, status) of every order lies in the allowed set". The trigger is given as context. The allowed set is given in the trigger code and also in the text. The trigger code would allow NULL prev_status because of SQL three-valued logic. But the natural language description says the pair must lie in the allowed set. Which one takes precedence? The problem says "Your task: verify whether the state is LEGAL. A state is LEGAL iff every one of the following holds." Then it lists four bullet points. The fourth bullet point is explicit. So we must follow the bullet point.
+
+But if the state has many NULL prev_status, it's clearly illegal. That seems too easy for a problem with 1390 line items. Maybe the empty prev_status is actually not NULL but an empty string, and the allowed set includes ('', 'pending')? No.
+
+Alternatively, maybe I misread the CSV. Let's look at the first few orders:
+
+1,1,delivered,shipped,2022-05-23,8871.9651
+2,1,delivered,shipped,2022-05-23,7445.85426
+3,1,pending,,2022-05-23,1212.0192
+4,1,pending,,2022-05-23,11100.1293
+5,1,pending,,2022-05-23,24382.6173
+6,2,shipped,pending,2022-02-17,3595.0332
+
+So orders 3,4,5 have empty prev_status. If that's a violation, then the answer is transition_break. But is there any order with prev_status empty and status not pending? Let's check: order 17 is pending, empty. Order 21 pending empty. Order 22 pending empty. Order 39 pending empty. Order 59 pending empty. Order 66 pending empty. Order 82 pending empty. Order 83 pending empty. Order 89 pending empty. Order 94 pending empty. Order 102 pending empty. Order 114 pending empty. Order 115 pending empty. Order 123 pending empty. Order 124 pending empty. Order 127 pending empty. Order 128 pending empty. Order 129 pending empty. Order 140 pending empty. Order 141 pending empty. Order 142 pending empty. Order 144 pending empty. Order 145 pending empty. Order 146 pending empty.
+
+All empty prev_status are with status pending. So the pair is (NULL, pending). The allowed set has (pending, pending). So if the empty prev_status is interpreted as 'pending', it would be allowed. But it's empty. In many databases, an empty string is different from NULL. But in CSV, empty is NULL. However, maybe the data generator used empty string to mean 'pending'? That would be weird.
+
+Let's consider the possibility that the problem expects us to treat empty prev_status as 'pending' because it's the initial state. The trigger comment says "-- initial state" for ['pending','pending']. The data shows empty prev_status for initial pending orders. Perhaps the data generator didn't populate prev_status for initial orders, but the intended rule is that initial orders have prev_status = 'pending'. The problem might have a bug, but we need to classify based on the given rules. The rule says the pair must be in the allowed set. If prev_status is missing, it's not in the set. So it's illegal.
+
+But before jumping to that, let's check if there are any derivation errors. Maybe the state is actually legal under all rules including transition if we consider NULL as allowed, and there is a derivation error somewhere. The problem might be designed to test derivation. Let's do some spot checks.
+
+We need to compute line_total = quantity * unit_price * (1 - discount(tier, quantity)). Then order.total = sum(line_total) * (1 + tax(country)).
+
+Let's pick a few orders and compute manually.
+
+Order 1: customer_id 1 (US, gold). Tax = 0.08. Order total should be sum(line_total) * 1.08.
+Items for order 1: ids 1-7.
+1: qty 6, unit_price 387.28. Tier gold, qty 6 -> discount 0.15. line_total = 6 * 387.28 * (1 - 0.15) = 6 * 387.28 * 0.85 = 6 * 329.188 = 1975.128. Matches CSV: 1975.128.
+2: qty 2, unit_price 84.27. Gold, qty 2 -> discount 0.10. line_total = 2 * 84.27 * 0.90 = 2 * 75.843 = 151.686. Matches.
+3: qty 6, unit_price 244.36. Gold, qty 6 -> discount 0.15. line_total = 6 * 244.36 * 0.85 = 6 * 207.706 = 1246.236. Matches.
+4: qty 5, unit_price 97.55. Gold, qty 5 -> discount 0.15. line_total = 5 * 97.55 * 0.85 = 5 * 82.9175 = 414.5875. Matches.
+5: qty 2, unit_price 396.21. Gold, qty 2 -> discount 0.10. line_total = 2 * 396.21 * 0.90 = 2 * 356.589 = 713.178. Matches.
+6: qty 4, unit_price 301.04. Gold, qty 4 -> discount 0.10. line_total = 4 * 301.04 * 0.90 = 4 * 270.936 = 1083.744. Matches.
+7: qty 9, unit_price 343.82. Gold, qty 9 -> discount 0.15. line_total = 9 * 343.82 * 0.85 = 9 * 292.247 = 2630.223. Matches.
+
+Sum line_total = 1975.128 + 151.686 + 1246.236 + 414.5875 + 713.178 + 1083.744 + 2630.223 = let's add:
+1975.128 + 151.686 = 2126.814
++1246.236 = 3373.05
++414.5875 = 3787.6375
++713.178 = 4500.8155
++1083.744 = 5584.5595
++2630.223 = 8214.7825
+
+Order total = 8214.7825 * (1 + 0.08) = 8214.7825 * 1.08 = 8871.9651. Let's compute: 8214.7825 * 1 = 8214.7825; *0.08 = 657.1826; sum = 8871.9651. Matches exactly. So order 1 is correct.
+
+Order 2: customer_id 1 (US, gold). Tax 0.08.
+Items 8-12:
+8: qty 6, 256.45. Gold, qty 6 -> 0.15. 6*256.45*0.85 = 6*217.9825 = 1307.895. Matches.
+9: qty 8, 333.3. Gold, qty 8 -> 0.15. 8*333.3*0.85 = 8*283.305 = 2266.44. Matches.
+10: qty 2, 206.91. Gold, qty 2 -> 0.10. 2*206.91*0.90 = 2*186.219 = 372.438. Matches.
+11: qty 8, 418.07. Gold, qty 8 -> 0.15. 8*418.07*0.85 = 8*355.3595 = 2842.876. Matches.
+12: qty 7, 17.59. Gold, qty 7 -> 0.15. 7*17.59*0.85 = 7*14.9515 = 104.6605. Matches.
+
+Sum = 1307.895 + 2266.44 = 3574.335
++372.438 = 3946.773
++2842.876 = 6789.649
++104.6605 = 6894.3095
+
+Total = 6894.3095 * 1.08 = 7445.85426. Compute: 6894.3095 * 0.08 = 551.54476; +6894.3095 = 7445.85426. Matches.
+
+Order 3: customer_id 1 (US, gold). Tax 0.08. Only item 13.
+13: qty 10, 140.28. Gold, qty 10 -> discount 0.20. line_total = 10 * 140.28 * 0.80 = 10 * 112.224 = 1122.24. Matches.
+Sum = 1122.24. Total = 1122.24 * 1.08 = 1212.0192. Matches.
+
+Order 4: customer_id 1 (US, gold). Tax 0.08. Items 14-25.
+14: qty 2, 253.57. Gold, qty 2 -> 0.10. 2*253.57*0.90 = 456.426. Matches.
+15: qty 1, 317.81. Gold, qty 1 -> 0.10. 1*317.81*0.90 = 286.029. Matches.
+16: qty 6, 321.65. Gold, qty 6 -> 0.15. 6*321.65*0.85 = 6*273.4025 = 1640.415. Matches.
+17: qty 4, 296.73. Gold, qty 4 -> 0.10. 4*296.73*0.90 = 4*267.057 = 1068.228. Matches.
+18: qty 4, 274.54. Gold, qty 4 -> 0.10. 4*274.54*0.90 = 4*247.086 = 988.344. Matches.
+19: qty 7, 89.02. Gold, qty 7 -> 0.15. 7*89.02*0.85 = 7*75.667 = 529.669. Matches.
+20: qty 8, 101.38. Gold, qty 8 -> 0.15. 8*101.38*0.85 = 8*86.173 = 689.384. Matches.
+21: qty 9, 73.29. Gold, qty 9 -> 0.15. 9*73.29*0.85 = 9*62.2965 = 560.6685. Matches.
+22: qty 7, 452.56. Gold, qty 7 -> 0.15. 7*452.56*0.85 = 7*384.676 = 2692.732. Matches.
+23: qty 1, 149.09. Gold, qty 1 -> 0.10. 1*149.09*0.90 = 134.181. Matches.
+24: qty 7, 172.98. Gold, qty 7 -> 0.15. 7*172.98*0.85 = 7*147.033 = 1029.231. Matches.
+25: qty 1, 225.1. Gold, qty 1 -> 0.10. 1*225.1*0.90 = 202.59. Matches.
+
+Sum: let's add:
+456.426 + 286.029 = 742.455
++1640.415 = 2382.87
++1068.228 = 3451.098
++988.344 = 4439.442
++529.669 = 4969.111
++689.384 = 5658.495
++560.6685 = 6219.1635
++2692.732 = 8911.8955
++134.181 = 9046.0765
++1029.231 = 10075.3075
++202.59 = 10277.8975
+
+Total = 10277.8975 * 1.08 = 11100.1293. Compute: 10277.8975 * 0.08 = 822.2318; sum = 11100.1293. Matches.
+
+So far, orders 1-4 are perfect. The derivation seems correct.
+
+Let's check an order for a different tier. Order 6: customer_id 2 (JP, bronze). Tax = 0.10.
+Items 43-44:
+43: qty 8, 369.52. Bronze, qty 8 -> discount 0.05. line_total = 8 * 369.52 * 0.95 = 8 * 351.044 = 2808.352. Matches.
+44: qty 1, 459.86. Bronze, qty 1 -> discount 0.00. line_total = 1 * 459.86 * 1 = 459.86. Matches.
+Sum = 2808.352 + 459.86 = 3268.212.
+Total = 3268.212 * 1.10 = 3595.0332. Matches.
+
+Order 7: customer_id 3 (DE, gold). Tax = 0.19.
+Items 45-53:
+45: qty 2, 325.41. Gold, qty 2 -> 0.10. 2*325.41*0.90 = 585.738. Matches.
+46: qty 10, 397.43. Gold, qty 10 -> 0.20. 10*397.43*0.80 = 3179.44. Matches.
+47: qty 1, 386.97. Gold, qty 1 -> 0.10. 1*386.97*0.90 = 348.273. Matches.
+48: qty 3, 69.13. Gold, qty 3 -> 0.10. 3*69.13*0.90 = 186.651. Matches.
+49: qty 2, 310.91. Gold, qty 2 -> 0.10. 2*310.91*0.90 = 559.638. Matches.
+50: qty 3, 369.48. Gold, qty 3 -> 0.10. 3*369.48*0.90 = 997.596. Matches.
+51: qty 5, 284.72. Gold, qty 5 -> 0.15. 5*284.72*0.85 = 1210.06. Matches.
+52: qty 3, 85.36. Gold, qty 3 -> 0.10. 3*85.36*0.90 = 230.472. Matches.
+53: qty 8, 31.81. Gold, qty 8 -> 0.15. 8*31.81*0.85 = 216.308. Matches.
+
+Sum: 585.738 + 3179.44 = 3765.178
++348.273 = 4113.451
++186.651 = 4300.102
++559.638 = 4859.74
++997.596 = 5857.336
++1210.06 = 7067.396
++230.472 = 7297.868
++216.308 = 7514.176
+
+Total = 7514.176 * 1.19 = 8941.86944. Compute: 7514.176 * 0.19 = 1427.69344; sum = 8941.86944. Matches.
+
+So derivation is very likely correct for all orders. The data seems carefully generated.
+
+Now, what about the transition rule? Let's check if any order has an illegal transition besides the empty prev_status. For example, order 10: cancelled,pending. Allowed. Order 14: cancelled,pending. Allowed. Order 18: cancelled,pending. Allowed. Order 32: cancelled,pending. Allowed. All cancelled have prev_status pending. All delivered have prev_status shipped. All shipped have prev_status pending. All pending have prev_status empty.
+
+So the only potential transition violations are the empty prev_status for pending orders.
+
+Now, does the problem consider empty prev_status as a violation? Let's read the problem statement again: "Status transition: the pair (prev_status, status) of every order lies in the allowed set
+    {(pending, shipped), (shipped, delivered),
+     (pending, cancelled), (pending, pending)}."
+
+It says "the pair (prev_status, status) of every order lies in the allowed set". If prev_status is NULL, the pair is (NULL, pending), which is not in the set. So it's a violation.
+
+But is there any possibility that the empty field is actually the string 'pending'? In CSV, if the field is empty, it's NULL. If it were 'pending', it would be written. So it's NULL.
+
+However, maybe the problem expects that the trigger's behavior defines the rule, and because of three-valued logic, NULL prev_status is allowed. But the problem explicitly lists the rule as the pair lying in the allowed set. The trigger is just provided as context. The classification instructions say: "A state is LEGAL iff every one of the following holds... Status transition: the pair (prev_status, status) of every order lies in the allowed set". So we must apply that rule literally.
+
+If we do, the state is ILLEGAL due to transition_break. But is there any other violation? Let's check if any order has prev_status = 'pending' and status = 'pending'. I don't see any. The initial state in the trigger is ['pending','pending'], but the data uses NULL prev_status for initial state. This is a mismatch.
+
+Wait, maybe the problem is designed to test whether we notice that the trigger allows NULL, and thus the state is legal under the trigger, but the natural language rule is ambiguous. However, the classification rules are explicit. The problem says "Default to LEGAL unless you can identify a specific row, value, or pair that violates one of the four rules above." So if we identify a violating pair, we output ILLEGAL.
+
+But maybe the empty prev_status is not considered a pair because NULL is not a value? The pair (prev_status, status) is defined for every order. If prev_status is NULL, it's still a pair (NULL, pending). The set does not contain it. So it's a violation.
+
+Let's consider the possibility that the problem expects us to treat NULL as "no previous status" and thus not subject to the transition rule. But the rule says "every order". So no exception.
+
+Alternatively, maybe the CSV uses empty string for prev_status, and the allowed set should be interpreted as containing ('', 'pending')? No.
+
+Let's check the DDL: prev_status VARCHAR(20). No NOT NULL constraint. So NULL is allowed. The trigger is the only thing enforcing transitions. The trigger as written allows NULL. So the database state could have been inserted with the trigger active. The problem says "A PL/pgSQL trigger function that enforces the legal status-transition set." If the trigger allows NULL, then the state is legal under the trigger. But the classification rules are separate. The problem might be testing whether we correctly interpret the trigger's behavior vs the natural language rule. However, the classification rules are given in the prompt: "A state is LEGAL iff every one of the following holds... Status transition: the pair (prev_status, status) of every order lies in the allowed set". This is the rule we must apply. The trigger is just part of the information. So we should apply the rule as written.
+
+But then the answer is trivial: many orders violate it. The problem might be too easy. But maybe there is a more subtle violation that makes it illegal even if we ignore the NULL prev_status. Let's check if any order has a transition that is not allowed. For example, order 9: delivered, shipped. That's (shipped, delivered)? Wait, order 9: status delivered, prev_status shipped. Allowed. Order 10: cancelled, pending. Allowed. Order 13: delivered, shipped. Allowed. Order 14: cancelled, pending. Allowed. Order 15: cancelled, pending. Allowed. Order 16: shipped, pending. Allowed. Order 17: pending, NULL. Not allowed. So yes.
+
+But maybe the problem expects that the empty prev_status is actually a missing value that should be ignored, and we need to check derivation. Let's check a few more orders to see if any derivation is off.
+
+Order 8: customer_id 4 (FR, bronze). Tax 0.20. Item 54 only.
+54: qty 6, 5.71. Bronze, qty 6 -> 0.05. line_total = 6*5.71*0.95 = 6*5.4245 = 32.547. Matches.
+Sum = 32.547. Total = 32.547 * 1.20 = 39.0564. Matches.
+
+Order 9: customer_id 5 (FR, gold). Tax 0.20. Many items 55-70.
+55: qty 7, 145.24. Gold, qty 7 -> 0.15. 7*145.24*0.85 = 7*123.454 = 864.178. Matches.
+56: qty 2, 269.15. Gold, qty 2 -> 0.10. 2*269.15*0.90 = 484.47. Matches.
+57: qty 10, 106.04. Gold, qty 10 -> 0.20. 10*106.04*0.80 = 848.32. Matches.
+58: qty 9, 346.94. Gold, qty 9 -> 0.15. 9*346.94*0.85 = 9*294.899 = 2654.091. Matches.
+59: qty 1, 354.3. Gold, qty 1 -> 0.10. 1*354.3*0.90 = 318.87. Matches.
+60: qty 1, 117.39. Gold, qty 1 -> 0.10. 1*117.39*0.90 = 105.651. Matches.
+61: qty 10, 65.59. Gold, qty 10 -> 0.20. 10*65.59*0.80 = 524.72. Matches.
+62: qty 5, 449.06. Gold, qty 5 -> 0.15. 5*449.06*0.85 = 5*381.701 = 1908.505. Matches.
+63: qty 10, 413.78. Gold, qty 10 -> 0.20. 10*413.78*0.80 = 3310.24. Matches.
+64: qty 7, 322.81. Gold, qty 7 -> 0.15. 7*322.81*0.85 = 7*274.3885 = 1920.7195. Matches.
+65: qty 1, 141.59. Gold, qty 1 -> 0.10. 1*141.59*0.90 = 127.431. Matches.
+66: qty 6, 444.46. Gold, qty 6 -> 0.15. 6*444.46*0.85 = 6*377.791 = 2266.746. Matches.
+67: qty 5, 391.32. Gold, qty 5 -> 0.15. 5*391.32*0.85 = 5*332.622 = 1663.11. Matches.
+68: qty 9, 149.22. Gold, qty 9 -> 0.15. 9*149.22*0.85 = 9*126.837 = 1141.533. Matches.
+69: qty 9, 59.17. Gold, qty 9 -> 0.15. 9*59.17*0.85 = 9*50.2945 = 452.6505. Matches.
+70: qty 2, 140.58. Gold, qty 2 -> 0.10. 2*140.58*0.90 = 253.044. Matches.
+
+Sum: let's add roughly:
+864.178 + 484.47 = 1348.648
++848.32 = 2196.968
++2654.091 = 4851.059
++318.87 = 5169.929
++105.651 = 5275.58
++524.72 = 5800.3
++1908.505 = 7708.805
++3310.24 = 11019.045
++1920.7195 = 12939.7645
++127.431 = 13067.1955
++2266.746 = 15333.9415
++1663.11 = 16997.0515
++1141.533 = 18138.5845
++452.6505 = 18591.235
++253.044 = 18844.279
+
+Total = 18844.279 * 1.20 = 22613.1348. Compute: 18844.279 * 0.2 = 3768.8558; sum = 22613.1348. Matches exactly.
+
+So derivation is spot on.
+
+Given that derivation is perfect, cardinality is perfect, FK is perfect, the only issue is transition. The problem likely expects us to catch the empty prev_status. But is there any order where prev_status is not empty but the transition is illegal? Let's scan for any prev_status that is not 'pending' or 'shipped'. Looking at the CSV:
+
+All prev_status values are either 'shipped', 'pending', or empty. No other values. So the only transition issue is empty prev_status with status pending.
+
+Now, does the problem consider empty prev_status as a violation? Let's think about the phrase "the pair (prev_status, status) of every order lies in the allowed set". In set theory, a pair containing NULL is not in the set of pairs of strings. So yes.
+
+But maybe the CSV empty fields are meant to be interpreted as 'pending' because the initial state is pending->pending, and the data generator omitted the prev_status for brevity? The problem says "Database state to classify" and gives CSV. In a real database, those would be NULL. The trigger would allow them due to three-valued logic. But the classification rule is explicit. The problem might be a trick: the trigger is flawed (allows NULL), but the rule is the rule. However, the prompt says "A PL/pgSQL trigger function that enforces the legal status-transition set." It doesn't say the trigger is flawed. It says the legal-transition set is a four-element relation. The trigger enforces it. But the trigger actually doesn't enforce it for NULL. The problem might be testing if we notice that the state violates the natural language rule despite being allowed by the trigger. Or maybe it's testing if we notice that the state is allowed by the trigger and thus legal? But the classification rules are given as four bullet points. We must follow them.
+
+Let's read the prompt again: "Your task: verify whether the state is LEGAL. A state is LEGAL iff every one of the following holds. A single violation makes the state ILLEGAL: - Referential integrity... - Cardinality... - Derivation... - Status transition: the pair (prev_status, status) of every order lies in the allowed set..."
+
+So it's unambiguous. The pair must be in the allowed set. If prev_status is NULL, it's not. So ILLEGAL.
+
+But wait, the problem says "Default to LEGAL unless you can identify a specific row, value, or pair that violates one of the four rules above." So we need to identify a specific violating pair. For example, order 3: prev_status is NULL (or empty), status is pending. The pair is not in the allowed set. So violation: transition_break.
+
+However, I want to double-check if there is any order with prev_status empty and status NOT pending. I scanned and found none. So all empty prev_status are with pending. So the violation is consistent.
+
+But is there any chance that the empty prev_status is actually the string 'pending' but got truncated? No.
+
+Alternatively, maybe the problem uses a different CSV parsing where empty string is considered as the default value, and the default for prev_status is 'pending'? The DDL has no default. So no.
+
+Given the evidence, I think the answer is ILLEGAL due to transition_break. But I want to be absolutely sure that there isn't a derivation error somewhere that I missed. Let's check a more complex order with a different country and tier.
+
+Order 10: customer_id 5 (FR, gold). Tax 0.20. Items 71-85.
+71: qty 9, 103.31. Gold, qty 9 -> 0.15. 9*103.31*0.85 = 9*87.8135 = 790.3215. Matches.
+72: qty 3, 344.13. Gold, qty 3 -> 0.10. 3*344.13*0.90 = 3*309.717 = 929.151. Matches.
+73: qty 2, 289.84. Gold, qty 2 -> 0.10. 2*289.84*0.90 = 2*260.856 = 521.712. Matches.
+74: qty 4, 482.0. Gold, qty 4 -> 0.10. 4*482.0*0.90 = 4*433.8 = 1735.2. Matches.
+75: qty 2, 125.02. Gold, qty 2 -> 0.10. 2*125.02*0.90 = 2*112.518 = 225.036. Matches.
+76: qty 6, 286.24. Gold, qty 6 -> 0.15. 6*286.24*0.85 = 6*243.304 = 1459.824. Matches.
+77: qty 7, 123.34. Gold, qty 7 -> 0.15. 7*123.34*0.85 = 7*104.839 = 733.873. Matches.
+78: qty 4, 335.3. Gold, qty 4 -> 0.10. 4*335.3*0.90 = 4*301.77 = 1207.08. Matches.
+79: qty 7, 209.12. Gold, qty 7 -> 0.15. 7*209.12*0.85 = 7*177.752 = 1244.264. Matches.
+80: qty 5, 165.81. Gold, qty 5 -> 0.15. 5*165.81*0.85 = 5*140.9385 = 704.6925. Matches.
+81: qty 9, 145.12. Gold, qty 9 -> 0.15. 9*145.12*0.85 = 9*123.352 = 1110.168. Matches.
+82: qty 1, 303.9. Gold, qty 1 -> 0.10. 1*303.9*0.90 = 273.51. Matches.
+83: qty 9, 167.23. Gold, qty 9 -> 0.15. 9*167.23*0.85 = 9*142.1455 = 1279.3095. Matches.
+84: qty 3, 468.81. Gold, qty 3 -> 0.10. 3*468.81*0.90 = 3*421.929 = 1265.787. Matches.
+85: qty 3, 413.94. Gold, qty 3 -> 0.10. 3*413.94*0.90 = 3*372.546 = 1117.638. Matches.
+
+Sum: let's add:
+790.3215 + 929.151 = 1719.4725
++521.712 = 2241.1845
++1735.2 = 3976.3845
++225.036 = 4201.4205
++1459.824 = 5661.2445
++733.873 = 6395.1175
++1207.08 = 7602.1975
++1244.264 = 8846.4615
++704.6925 = 9551.154
++1110.168 = 10661.322
++273.51 = 10934.832
++1279.3095 = 12214.1415
++1265.787 = 13479.9285
++1117.638 = 14597.5665
+
+Total = 14597.5665 * 1.20 = 17517.0798. Compute: 14597.5665 * 0.2 = 2919.5133; sum = 17517.0798. Matches.
+
+So derivation is definitely correct.
+
+Now, what about the open-order limit? We counted and it's fine.
+
+Item count per order: we saw max 20, min 1. Let's verify if any order has 0 items. All orders seem to have items. The first item is order 1, last is order 152. We can check if any order_id is missing in order_items. For example, order 41 has items 415-416 (2 items). Order 34 has item 107 only? Let's check: order 34 appears in item 107 only? Actually items for order 34: id 323-341. That's 19 items. Order 107 appears in items 971-980. So every order seems to have items. No 0-item orders.
+
+Thus, the only violation is transition.
+
+But I need to be careful: the problem might consider the empty prev_status as acceptable because the trigger is the enforcement mechanism, and the trigger allows it. However, the classification rules explicitly list the allowed pairs. The problem says "Status transition: the pair (prev_status, status) of every order lies in the allowed set". It does not say "or prev_status is NULL". So I will classify as ILLEGAL, transition_break.
+
+Wait, but the problem also says "A single violation makes the state ILLEGAL". So if there is any transition violation, it's ILLEGAL.
+
+Let's double-check the exact wording: "Status transition: the pair (prev_status, status) of every order lies in the allowed set
+    {(pending, shipped), (shipped, delivered),
+     (pending, cancelled), (pending, pending)}."
+
+If prev_status is empty/NULL, the pair is (NULL, pending). This is not in the set. So it's a violation.
+
+Therefore, the answer is {"label": "ILLEGAL", "violation": "transition_break"}.
+
+But before finalizing, let me consider if there is any order where prev_status is empty and status is not pending. I didn't see any. So the violation is consistent.
+
+One more thought: could the empty prev_status be interpreted as the string "pending"? In some CSV conventions, missing values are NULL. But maybe the problem uses a different convention? The header is "id,customer_id,status,prev_status,order_date,total". For order 3, it's "3,1,pending,,2022-05-23,1212.0192". If the empty field were 'pending', it would be "3,1,pending,pending,2022-05-23,1212.0192". So it's definitely not 'pending'.
+
+Thus, the state is ILLEGAL.
+
+However, I recall that in some similar problems, the initial state is represented by prev_status = NULL, and the rule is that either prev_status is NULL and status is pending, or the pair is in the allowed set. But here the rule is explicit. The trigger comment says "-- initial state" for ['pending','pending'], which suggests the initial state should have prev_status = 'pending'. The data doesn't match that. So it's a violation.
+
+I will output the JSON.
+
+But wait, the problem says "Reply with a single JSON object on one line, no prose". So I must output exactly that.
+
+One more check: is there any order with prev_status = 'shipped' and status = 'pending'? That would be a violation. Let's scan: all shipped have prev_status pending. All delivered have prev_status shipped. All cancelled have prev_status pending. All pending have prev_status empty. So no other illegal transitions.
+
+Thus, the violation is transition_break.
+
+I will answer accordingly.

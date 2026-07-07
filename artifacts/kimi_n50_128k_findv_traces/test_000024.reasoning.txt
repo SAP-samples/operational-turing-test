@@ -1,0 +1,845 @@
+We need to classify the database state as LEGAL or ILLEGAL based on four categories: referential integrity, cardinality, derivation, status transition. We must check each in order? The output violation must be one of fk_break, cardinality_break, derivation_break, transition_break. We need to find if any violation exists. If multiple, we can pick any? The instruction says "if any check fails, where X is one of ...". Usually we should report the first or any. But we need to be accurate.
+
+Given the size, we need to systematically check. Let's parse the data.
+
+First, customers: 50 customers, id 1..50.
+
+Orders: 151 orders, id 1..151.
+
+Order_items: 1603 items.
+
+We need to check:
+
+1. Referential integrity:
+   - Every orders.customer_id in customers.id. Customers id 1..50. Check orders customer_ids: all seem <=50? Let's scan. Orders have customer_id up to 50? Let's see: order 150 has customer_id 50. Order 151? Actually orders go to 151. Let's check max customer_id. Looking at orders.csv: last few rows: 150,50,... 151,48,... So max is 50. All should be fine.
+   - Every order_items.order_id in orders.id. Order_items order_id range: up to 151? Let's check last rows: 1603,151,... Yes. So FK likely holds. But we need to ensure no order_id missing. Since orders are 1..151 and items reference them, likely okay. But we should verify that every order_id in items exists in orders. Since orders id go 1..151, and items order_id seem within that, it's okay.
+
+2. Cardinality:
+   - Each order has 1-20 line items. Need to count items per order. There are 151 orders. We need to check if any order has 0 items or >20 items.
+   - Each customer has at most 3 open orders (status in {pending, shipped}). Need to count per customer.
+
+3. Derivation:
+   - line_total = quantity * unit_price * (1 - discount(tier, quantity))
+   - discount depends on tier and quantity bucket.
+   - order.total = sum(line_total) * (1 + tax(country))
+   - tax depends on country.
+
+4. Status transition:
+   - (prev_status, status) must be in allowed set: (pending, shipped), (shipped, delivered), (pending, cancelled), (pending, pending).
+   - Note: prev_status can be empty? In CSV, some prev_status are empty (e.g., order 8: prev_status empty, status pending). The trigger uses ARRAY[NEW.prev_status, NEW.status]. If prev_status is NULL, then ARRAY[NULL, 'pending'] would not match any allowed array because allowed arrays have 'pending' as first element. Wait, allowed includes ['pending','pending'] and ['pending','shipped'] etc. If prev_status is NULL, then ARRAY[NULL, 'pending'] is not equal to ANY of those. However, in the data, for initial state, prev_status is empty. Does the trigger allow NULL? The trigger as written: IF NOT (ARRAY[NEW.prev_status, NEW.status] = ANY (allowed)) THEN RAISE. If NEW.prev_status is NULL, then ARRAY[NULL, 'pending'] = ANY (ARRAY[['pending',...],...])? In PostgreSQL, array equality with NULL elements returns NULL, not TRUE. So = ANY would be NULL, and NOT NULL is NULL, which in IF NOT would be treated as false? Actually in PL/pgSQL, IF NOT (NULL) is treated as false? Let's recall: In PL/pgSQL, a boolean expression that evaluates to NULL is treated as false in IF. Wait, no: In SQL, NULL is unknown. In PL/pgSQL control structures, IF condition must be boolean. If the expression is NULL, it's treated as false? Actually, the documentation says: "If the expression yields true, then the statements are executed. If it yields false or null, they are not." So IF NOT (NULL) would be NULL? Let's think: The condition is "NOT (ARRAY[...] = ANY(...))". If the inner equality is NULL, then NOT NULL is NULL. Then IF NULL -> false, so the RAISE is not executed. So NULL prev_status would pass. But the problem statement says the legal-transition set includes (pending, pending) as initial state. It doesn't explicitly mention NULL. However, in the data, prev_status is empty for initial pending orders. We need to interpret empty as NULL. The allowed set in trigger includes ['pending','pending'] but not [NULL,'pending']. But as per trigger semantics, it might pass. However, the problem statement says: "the pair (prev_status, status) of every order lies in the allowed set {(pending, shipped), (shipped, delivered), (pending, cancelled), (pending, pending)}." It doesn't mention NULL. But in the data, prev_status is empty for some rows. Does empty mean NULL? In CSV, empty string. When loaded into VARCHAR, it could be empty string ''. The trigger uses ARRAY[NEW.prev_status, NEW.status]. If prev_status is empty string '', then ARRAY['', 'pending'] is not equal to any allowed. Then NOT FALSE = TRUE, and trigger would raise. But the data is given as a state to classify; perhaps the empty prev_status is meant to represent NULL? Or maybe the state is illegal because of empty prev_status? Wait, the trigger function is provided to define the rule. The rule says allowed transitions are those four. The problem says "Status transition: the pair (prev_status, status) of every order lies in the allowed set ...". So we must check that pair. For orders with prev_status empty, the pair is ('', 'pending') which is NOT in the set. That would be a transition_break. But is empty string considered NULL? In the CSV, it's blank. Usually in such problems, blank means NULL. But the allowed set includes (pending,pending) as initial state. If prev_status is NULL, the pair is (NULL, pending). Is that considered in the set? The set doesn't include NULL. However, maybe the blank is meant to be 'pending'? No, that would be weird.
+
+Let's examine the data: orders with empty prev_status have status 'pending'. For example:
+8,3,pending,,...
+11,5,pending,,...
+12,5,pending,,...
+18,7,pending,,...
+21,9,pending,,...
+23,10,pending,,...
+31,12,pending,,...
+35,13,pending,,...
+44,15,pending,,...
+46,16,pending,,...
+50,17,pending,,...
+56,19,pending,,...
+67,23,pending,,...
+69,24,pending,,...
+85,28,pending,,...
+91,30,pending,,...
+95,31,pending,,...
+96,31,pending,,...
+108,36,pending,,...
+110,36,pending,,...
+119,39,pending,,...
+124,40,pending,,...
+126,41,pending,,...
+130,42,pending,,...
+135,44,pending,,...
+144,48,pending,,...
+147,49,pending,,...
+150,50,pending,,...
+
+So many initial pending orders have blank prev_status. If blank is treated as NULL, then the pair (NULL, pending) is not in the allowed set. But the trigger code uses ARRAY[NEW.prev_status, NEW.status] = ANY (allowed). In PostgreSQL, comparing an array containing NULL to a literal array returns NULL, and IF NOT NULL is false, so it would NOT raise. Thus the trigger would allow NULL prev_status with pending status. But the natural language rule says the pair must lie in the allowed set. This is ambiguous.
+
+However, the problem statement explicitly says: "Status transition: the pair (prev_status, status) of every order lies in the allowed set {(pending, shipped), (shipped, delivered), (pending, cancelled), (pending, pending)}." It does not mention NULL. But in the data, prev_status is empty. We need to decide if empty is considered 'pending' or NULL. In the context of the trigger, the initial state is represented as (pending,pending). But the data has blank prev_status. This suggests that maybe the blank is meant to be NULL, and the trigger handles it. But the classification instruction uses the natural language rule, not the trigger code? It says "Status transition: the pair (prev_status, status) of every order lies in the allowed set ...". So we must apply that literally. If prev_status is empty string, then it's not in the set. But maybe empty string is considered NULL and the pair (NULL, pending) is not in the set, so it's a violation.
+
+But wait, the problem says "A state is LEGAL iff every one of the following holds." and lists the four checks. The status transition check is defined as the pair lying in that set. So if prev_status is empty/NULL, it's not in the set. That would make the state ILLEGAL with transition_break.
+
+However, many orders have empty prev_status. It seems unlikely that the entire state is illegal just because of that, unless it's a trick. But the problem is designed to test careful reading. Let's hold that thought and check other constraints first. Maybe there is another violation that is more obvious.
+
+Let's check cardinality: per-customer open-order limit.
+
+Open orders = status in {pending, shipped}. We need to count per customer.
+
+We have 50 customers. Let's tally open orders per customer.
+
+I'll go through orders.csv and count.
+
+Customer 1: orders 1(delivered),2(delivered),3(shipped). Open: 1 (order 3). <=3 OK.
+Customer 2: order 4(cancelled). Open: 0.
+Customer 3: orders 5(delivered),6(cancelled),7(shipped),8(pending),9(shipped). Open: 7,8,9 => 3. <=3 OK.
+Customer 4: order 10(cancelled). Open:0.
+Customer 5: orders 11(pending),12(pending). Open:2. OK.
+Customer 6: orders 13(cancelled),14(cancelled),15(delivered). Open:0.
+Customer 7: orders 16(delivered),17(cancelled),18(pending). Open:1. OK.
+Customer 8: order 19(delivered). Open:0.
+Customer 9: orders 20(delivered),21(pending). Open:1. OK.
+Customer 10: orders 22(delivered),23(pending),24(shipped). Open:2. OK.
+Customer 11: orders 25(delivered),26(delivered),27(delivered),28(shipped),29(shipped). Open:2. OK.
+Customer 12: orders 30(delivered),31(pending). Open:1. OK.
+Customer 13: orders 32(cancelled),33(delivered),34(shipped),35(pending). Open:2. OK.
+Customer 14: orders 36(delivered),37(cancelled),38(shipped),39(shipped). Open:2. OK.
+Customer 15: orders 40(delivered),41(cancelled),42(delivered),43(delivered),44(pending). Open:1. OK.
+Customer 16: orders 45(cancelled),46(pending). Open:1. OK.
+Customer 17: orders 47(delivered),48(delivered),49(shipped),50(pending). Open:2. OK.
+Customer 18: order 51(cancelled). Open:0.
+Customer 19: orders 52(delivered),53(delivered),54(delivered),55(delivered),56(pending). Open:1. OK.
+Customer 20: orders 57(delivered),58(cancelled),59(cancelled),60(cancelled),61(delivered). Open:0.
+Customer 21: orders 62(delivered),63(cancelled),64(shipped). Open:1. OK.
+Customer 22: orders 65(delivered),66(delivered). Open:0.
+Customer 23: orders 67(pending),68(shipped). Open:2. OK.
+Customer 24: order 69(pending). Open:1. OK.
+Customer 25: orders 70(delivered),71(cancelled),72(delivered),73(delivered),74(delivered). Open:0.
+Customer 26: orders 75(delivered),76(delivered),77(delivered),78(shipped). Open:1. OK.
+Customer 27: orders 79(delivered),80(delivered),81(delivered),82(cancelled),83(shipped). Open:1. OK.
+Customer 28: orders 84(shipped),85(pending),86(pending). Open:3. OK.
+Customer 29: orders 87(cancelled),88(delivered),89(shipped). Open:1. OK.
+Customer 30: orders 90(delivered),91(pending),92(shipped). Open:2. OK.
+Customer 31: orders 93(cancelled),94(cancelled),95(pending),96(pending),97(pending). Open:3. OK.
+Customer 32: orders 98(delivered),99(cancelled),100(cancelled). Open:0.
+Customer 33: order 101(shipped). Open:1. OK.
+Customer 34: orders 102(delivered),103(cancelled). Open:0.
+Customer 35: orders 104(delivered),105(delivered),106(delivered). Open:0.
+Customer 36: orders 107(delivered),108(pending),109(pending),110(pending). Open:3. OK.
+Customer 37: orders 111(cancelled),112(delivered),113(delivered). Open:0.
+Customer 38: orders 114(delivered),115(pending),116(shipped). Open:2. OK.
+Customer 39: orders 117(pending),118(shipped),119(pending). Open:3. OK.
+Customer 40: orders 120(delivered),121(cancelled),122(delivered),123(shipped),124(pending). Open:2. OK.
+Customer 41: orders 125(delivered),126(pending). Open:1. OK.
+Customer 42: orders 127(delivered),128(delivered),129(delivered),130(pending),131(shipped). Open:2. OK.
+Customer 43: orders 132(delivered). Open:0.
+Customer 44: orders 133(cancelled),134(shipped),135(pending),136(shipped). Open:3. OK.
+Customer 45: order 137(delivered). Open:0.
+Customer 46: order 138(shipped). Open:1. OK.
+Customer 47: orders 139(delivered),140(cancelled),141(delivered),142(cancelled). Open:0.
+Customer 48: orders 143(cancelled),144(pending),145(pending). Open:2. OK.
+Customer 49: orders 146(cancelled),147(pending),148(shipped),149(pending). Open:3. OK.
+Customer 50: orders 150(pending),151(shipped). Open:2. OK.
+
+So no customer has >3 open orders. Cardinality for customers is fine.
+
+Now per-order item count: each order must have 1-20 line items. We need to count items per order. There are 151 orders. Let's see if any order has >20 items or 0 items.
+
+We can count from order_items.csv. Let's tally by order_id.
+
+I'll scan through order_items and count per order_id.
+
+Order 1: items 1-7 => 7 items.
+Order 2: items 8-18 => 11 items.
+Order 3: items 19-28 => 10 items.
+Order 4: items 29-44 => 16 items.
+Order 5: items 45-61 => 17 items.
+Order 6: items 62-67 => 6 items.
+Order 7: items 68-85 => 18 items.
+Order 8: items 86-102 => 17 items.
+Order 9: items 103-116 => 14 items.
+Order 10: items 117-118 => 2 items.
+Order 11: items 119-124 => 6 items.
+Order 12: items 125-132 => 8 items.
+Order 13: items 133-137 => 5 items.
+Order 14: items 138-149 => 12 items.
+Order 15: items 150-169 => 20 items.
+Order 16: items 170-176 => 7 items.
+Order 17: items 177-194 => 18 items.
+Order 18: items 195-211 => 17 items.
+Order 19: items 212-228 => 17 items.
+Order 20: items 229-233 => 5 items.
+Order 21: items 234-248 => 15 items.
+Order 22: items 249-260 => 12 items.
+Order 23: items 261-265 => 5 items.
+Order 24: items 266-272 => 7 items.
+Order 25: items 273-277 => 5 items.
+Order 26: items 278-290 => 13 items.
+Order 27: items 291-310 => 20 items.
+Order 28: items 311-328 => 18 items.
+Order 29: items 329-336 => 8 items.
+Order 30: items 337-349 => 13 items.
+Order 31: items 350-353 => 4 items.
+Order 32: items 354-370 => 17 items.
+Order 33: items 371-378 => 8 items.
+Order 34: items 379-387 => 9 items.
+Order 35: items 388-395 => 8 items.
+Order 36: items 396-399 => 4 items.
+Order 37: items 400-414 => 15 items.
+Order 38: items 415-416 => 2 items.
+Order 39: items 417-420 => 4 items.
+Order 40: items 421-432 => 12 items.
+Order 41: items 433-439 => 7 items.
+Order 42: items 440-445 => 6 items.
+Order 43: items 446-458 => 13 items.
+Order 44: items 459-478 => 20 items.
+Order 45: items 479-480 => 2 items.
+Order 46: items 481-496 => 16 items.
+Order 47: items 497-513 => 17 items.
+Order 48: items 514-518 => 5 items.
+Order 49: items 519-527 => 9 items.
+Order 50: items 528-535 => 8 items.
+Order 51: items 536-548 => 13 items.
+Order 52: items 549-557 => 9 items.
+Order 53: items 558-575 => 18 items.
+Order 54: item 576 => 1 item.
+Order 55: items 577-592 => 16 items.
+Order 56: items 593-596 => 4 items.
+Order 57: items 597-601 => 5 items.
+Order 58: items 602-618 => 17 items.
+Order 59: items 619-628 => 10 items.
+Order 60: items 629-646 => 18 items.
+Order 61: items 647-666 => 20 items.
+Order 62: items 667-673 => 7 items.
+Order 63: items 674-681 => 8 items.
+Order 64: items 682-686 => 5 items.
+Order 65: item 687 => 1 item.
+Order 66: items 688-702 => 15 items.
+Order 67: items 703-719 => 17 items.
+Order 68: items 720-721 => 2 items.
+Order 69: items 722-733 => 12 items.
+Order 70: items 734-746 => 13 items.
+Order 71: items 747-763 => 17 items.
+Order 72: items 764-779 => 16 items.
+Order 73: items 780-793 => 14 items.
+Order 74: items 794-810 => 17 items.
+Order 75: item 811 => 1 item.
+Order 76: items 812-822 => 11 items.
+Order 77: item 823 => 1 item.
+Order 78: items 824-825 => 2 items.
+Order 79: items 826-832 => 7 items.
+Order 80: item 833 => 1 item.
+Order 81: items 834-847 => 14 items.
+Order 82: items 848-860 => 13 items.
+Order 83: items 861-871 => 11 items.
+Order 84: items 872-874 => 3 items.
+Order 85: items 875-883 => 9 items.
+Order 86: items 884-889 => 6 items.
+Order 87: items 890-903 => 14 items.
+Order 88: items 904-913 => 10 items.
+Order 89: items 914-932 => 19 items.
+Order 90: items 933-949 => 17 items.
+Order 91: items 950-964 => 15 items.
+Order 92: items 965-971 => 7 items.
+Order 93: items 972-988 => 17 items.
+Order 94: items 989-999 => 11 items.
+Order 95: items 1000-1001 => 2 items.
+Order 96: items 1002-1014 => 13 items.
+Order 97: items 1015-1028 => 14 items.
+Order 98: items 1029-1041 => 13 items.
+Order 99: items 1042-1058 => 17 items.
+Order 100: items 1059-1074 => 16 items.
+Order 101: items 1075-1076 => 2 items.
+Order 102: items 1077-1089 => 13 items.
+Order 103: items 1090-1091 => 2 items.
+Order 104: items 1092-1094 => 3 items.
+Order 105: item 1095 => 1 item.
+Order 106: items 1096-1111 => 16 items.
+Order 107: items 1112-1126 => 15 items.
+Order 108: items 1127-1143 => 17 items.
+Order 109: items 1144-1149 => 6 items.
+Order 110: items 1150-1163 => 14 items.
+Order 111: items 1164-1176 => 13 items.
+Order 112: items 1177-1193 => 17 items.
+Order 113: items 1194-1195 => 2 items.
+Order 114: items 1196-1205 => 10 items.
+Order 115: items 1206-1222 => 17 items.
+Order 116: items 1223-1240 => 18 items.
+Order 117: items 1241-1244 => 4 items.
+Order 118: items 1245-1253 => 9 items.
+Order 119: items 1254-1258 => 5 items.
+Order 120: item 1259 => 1 item.
+Order 121: items 1260-1278 => 19 items.
+Order 122: items 1279-1282 => 4 items.
+Order 123: items 1283-1286 => 4 items.
+Order 124: items 1287-1288 => 2 items.
+Order 125: items 1289-1307 => 19 items.
+Order 126: items 1308-1323 => 16 items.
+Order 127: items 1324-1340 => 17 items.
+Order 128: items 1341-1354 => 14 items.
+Order 129: items 1355-1358 => 4 items.
+Order 130: items 1359-1373 => 15 items.
+Order 131: items 1374-1393 => 20 items.
+Order 132: items 1394-1406 => 13 items.
+Order 133: items 1407-1422 => 16 items.
+Order 134: items 1423-1437 => 15 items.
+Order 135: items 1438-1439 => 2 items.
+Order 136: items 1440-1457 => 18 items.
+Order 137: items 1458-1469 => 12 items.
+Order 138: items 1470-1473 => 4 items.
+Order 139: items 1474-1477 => 4 items.
+Order 140: items 1478-1496 => 19 items.
+Order 141: items 1497-1511 => 15 items.
+Order 142: items 1512-1524 => 13 items.
+Order 143: items 1525-1530 => 6 items.
+Order 144: items 1531-1534 => 4 items.
+Order 145: items 1535-1547 => 13 items.
+Order 146: items 1548-1558 => 11 items.
+Order 147: items 1559-1561 => 3 items.
+Order 148: items 1562-1581 => 20 items.
+Order 149: items 1582-1583 => 2 items.
+Order 150: items 1584-1597 => 14 items.
+Order 151: items 1598-1603 => 6 items.
+
+All orders seem to have between 1 and 20 items. So cardinality is fine.
+
+Now derivation. This is the heavy part. We need to check line_total and order.total.
+
+First, define discount function:
+
+tier: bronze, silver, gold.
+quantity buckets: [1,4], [5,9], [10,19]. (quantity=20 is not in any bucket? Actually the table says qty in [10,19], and quantity=20 is a per-order cardinality bound, not a discount band. So what discount for qty=20? The table doesn't specify. But maybe quantity is always in [1,20] and the maximum bucket is closed at 19. So for qty=20, perhaps no discount? Or maybe it's not allowed to have qty=20? The rule says "quantity is always in [1, 20]; the maximum bucket is closed at 19, and quantity = 20 is a per-order cardinality bound, not a discount band." This implies that qty=20 can occur, but the discount table doesn't cover it. However, maybe the discount for qty=20 is the same as [10,19]? Or maybe there are no qty=20 in the data. Let's check if any quantity=20 appears.
+
+Scanning order_items: I see quantities like 10, 9, 8, etc. Do we see 20? Let's check. Order 15 has qty 10? Order 27 has qty 10? I need to check if any quantity >19. The per-order item count is 1-20 line items, not quantity. Quantity per line can be up to? The DDL says quantity > 0. The procedural rule says quantity is always in [1,20]. So quantity max 20. But discount table covers up to 19. For qty=20, discount is undefined. Let's see if any line has quantity=20.
+
+Looking through: item 15: qty 5. Item 28: qty 9. Item 30: qty 10. Item 44: qty 10. Item 45: qty 10. Many qty 10. Any qty 20? Let's search mentally. Item 100: qty 5. Item 101: qty 8. Item 102: qty 7. Item 103: qty 8. Item 104: qty 10. Item 105: qty 2. Item 106: qty 6. Item 107: qty 4. Item 108: qty 9. Item 109: qty 10. Item 110: qty 9. Item 111: qty 5. Item 112: qty 6. Item 113: qty 1. Item 114: qty 2. Item 115: qty 10. Item 116: qty 6. Item 117: qty 3. Item 118: qty 7. Item 119: qty 1. Item 120: qty 2. Item 121: qty 2. Item 122: qty 4. Item 123: qty 3. Item 124: qty 1. Item 125: qty 5. Item 126: qty 5. Item 127: qty 2. Item 128: qty 8. Item 129: qty 3. Item 130: qty 10. Item 131: qty 7. Item 132: qty 10. Item 133: qty 6. Item 134: qty 8. Item 135: qty 3. Item 136: qty 3. Item 137: qty 8. Item 138: qty 1. Item 139: qty 2. Item 140: qty 10. Item 141: qty 1. Item 142: qty 6. Item 143: qty 2. Item 144: qty 6. Item 145: qty 9. Item 146: qty 5. Item 147: qty 5. Item 148: qty 9. Item 149: qty 5. Item 150: qty 1. Item 151: qty 2. Item 152: qty 8. Item 153: qty 9. Item 154: qty 8. Item 155: qty 9. Item 156: qty 4. Item 157: qty 4. Item 158: qty 2. Item 159: qty 4. Item 160: qty 2. Item 161: qty 1. Item 162: qty 3. Item 163: qty 8. Item 164: qty 5. Item 165: qty 4. Item 166: qty 6. Item 167: qty 5. Item 168: qty 8. Item 169: qty 6. Item 170: qty 7. Item 171: qty 3. Item 172: qty 9. Item 173: qty 2. Item 174: qty 1. Item 175: qty 5. Item 176: qty 2. Item 177: qty 4. Item 178: qty 2. Item 179: qty 5. Item 180: qty 4. Item 181: qty 10. Item 182: qty 4. Item 183: qty 4. Item 184: qty 9. Item 185: qty 8. Item 186: qty 4. Item 187: qty 10. Item 188: qty 10. Item 189: qty 2. Item 190: qty 8. Item 191: qty 8. Item 192: qty 3. Item 193: qty 3. Item 194: qty 6. Item 195: qty 1. Item 196: qty 4. Item 197: qty 4. Item 198: qty 2. Item 199: qty 7. Item 200: qty 3. Item 201: qty 1. Item 202: qty 2. Item 203: qty 10. Item 204: qty 9. Item 205: qty 8. Item 206: qty 7. Item 207: qty 4. Item 208: qty 1. Item 209: qty 5. Item 210: qty 7. Item 211: qty 1. Item 212: qty 5. Item 213: qty 9. Item 214: qty 8. Item 215: qty 10. Item 216: qty 5. Item 217: qty 3. Item 218: qty 5. Item 219: qty 2. Item 220: qty 3. Item 221: qty 6. Item 222: qty 10. Item 223: qty 7. Item 224: qty 4. Item 225: qty 3. Item 226: qty 7. Item 227: qty 3. Item 228: qty 2. Item 229: qty 3. Item 230: qty 4. Item 231: qty 8. Item 232: qty 1. Item 233: qty 2. Item 234: qty 6. Item 235: qty 5. Item 236: qty 1. Item 237: qty 10. Item 238: qty 2. Item 239: qty 9. Item 240: qty 7. Item 241: qty 2. Item 242: qty 2. Item 243: qty 3. Item 244: qty 5. Item 245: qty 2. Item 246: qty 10. Item 247: qty 9. Item 248: qty 7. Item 249: qty 6. Item 250: qty 6. Item 251: qty 3. Item 252: qty 9. Item 253: qty 3. Item 254: qty 8. Item 255: qty 2. Item 256: qty 6. Item 257: qty 4. Item 258: qty 10. Item 259: qty 9. Item 260: qty 4. Item 261: qty 2. Item 262: qty 2. Item 263: qty 1. Item 264: qty 3. Item 265: qty 2. Item 266: qty 8. Item 267: qty 1. Item 268: qty 8. Item 269: qty 9. Item 270: qty 9. Item 271: qty 5. Item 272: qty 7. Item 273: qty 2. Item 274: qty 2. Item 275: qty 5. Item 276: qty 10. Item 277: qty 10. Item 278: qty 10. Item 279: qty 1. Item 280: qty 9. Item 281: qty 6. Item 282: qty 8. Item 283: qty 5. Item 284: qty 9. Item 285: qty 2. Item 286: qty 2. Item 287: qty 3. Item 288: qty 4. Item 289: qty 1. Item 290: qty 5. Item 291: qty 1. Item 292: qty 5. Item 293: qty 7. Item 294: qty 8. Item 295: qty 7. Item 296: qty 6. Item 297: qty 7. Item 298: qty 1. Item 299: qty 3. Item 300: qty 2. Item 301: qty 6. Item 302: qty 10. Item 303: qty 3. Item 304: qty 8. Item 305: qty 8. Item 306: qty 8. Item 307: qty 6. Item 308: qty 5. Item 309: qty 7. Item 310: qty 8. Item 311: qty 3. Item 312: qty 7. Item 313: qty 3. Item 314: qty 4. Item 315: qty 6. Item 316: qty 7. Item 317: qty 5. Item 318: qty 6. Item 319: qty 2. Item 320: qty 7. Item 321: qty 7. Item 322: qty 8. Item 323: qty 8. Item 324: qty 1. Item 325: qty 8. Item 326: qty 7. Item 327: qty 6. Item 328: qty 1. Item 329: qty 3. Item 330: qty 3. Item 331: qty 2. Item 332: qty 3. Item 333: qty 2. Item 334: qty 8. Item 335: qty 9. Item 336: qty 5. Item 337: qty 3. Item 338: qty 3. Item 339: qty 3. Item 340: qty 1. Item 341: qty 3. Item 342: qty 6. Item 343: qty 1. Item 344: qty 10. Item 345: qty 2. Item 346: qty 2. Item 347: qty 5. Item 348: qty 4. Item 349: qty 1. Item 350: qty 5. Item 351: qty 6. Item 352: qty 7. Item 353: qty 10. Item 354: qty 10. Item 355: qty 2. Item 356: qty 9. Item 357: qty 7. Item 358: qty 6. Item 359: qty 5. Item 360: qty 3. Item 361: qty 5. Item 362: qty 2. Item 363: qty 1. Item 364: qty 5. Item 365: qty 2. Item 366: qty 2. Item 367: qty 1. Item 368: qty 4. Item 369: qty 5. Item 370: qty 2. Item 371: qty 3. Item 372: qty 1. Item 373: qty 7. Item 374: qty 2. Item 375: qty 10. Item 376: qty 4. Item 377: qty 8. Item 378: qty 7. Item 379: qty 6. Item 380: qty 2. Item 381: qty 4. Item 382: qty 9. Item 383: qty 2. Item 384: qty 7. Item 385: qty 6. Item 386: qty 4. Item 387: qty 2. Item 388: qty 3. Item 389: qty 7. Item 390: qty 8. Item 391: qty 10. Item 392: qty 7. Item 393: qty 7. Item 394: qty 1. Item 395: qty 1. Item 396: qty 6. Item 397: qty 1. Item 398: qty 8. Item 399: qty 2. Item 400: qty 6. Item 401: qty 6. Item 402: qty 4. Item 403: qty 6. Item 404: qty 6. Item 405: qty 9. Item 406: qty 5. Item 407: qty 1. Item 408: qty 2. Item 409: qty 9. Item 410: qty 7. Item 411: qty 2. Item 412: qty 4. Item 413: qty 8. Item 414: qty 8. Item 415: qty 4. Item 416: qty 2. Item 417: qty 3. Item 418: qty 7. Item 419: qty 10. Item 420: qty 2. Item 421: qty 2. Item 422: qty 5. Item 423: qty 7. Item 424: qty 7. Item 425: qty 5. Item 426: qty 2. Item 427: qty 4. Item 428: qty 9. Item 429: qty 4. Item 430: qty 7. Item 431: qty 9. Item 432: qty 4. Item 433: qty 1. Item 434: qty 6. Item 435: qty 2. Item 436: qty 5. Item 437: qty 3. Item 438: qty 10. Item 439: qty 6. Item 440: qty 10. Item 441: qty 1. Item 442: qty 10. Item 443: qty 7. Item 444: qty 3. Item 445: qty 1. Item 446: qty 8. Item 447: qty 3. Item 448: qty 1. Item 449: qty 7. Item 450: qty 5. Item 451: qty 8. Item 452: qty 2. Item 453: qty 6. Item 454: qty 7. Item 455: qty 1. Item 456: qty 2. Item 457: qty 8. Item 458: qty 2. Item 459: qty 2. Item 460: qty 5. Item 461: qty 6. Item 462: qty 4. Item 463: qty 6. Item 464: qty 2. Item 465: qty 10. Item 466: qty 5. Item 467: qty 10. Item 468: qty 2. Item 469: qty 5. Item 470: qty 5. Item 471: qty 6. Item 472: qty 7. Item 473: qty 1. Item 474: qty 9. Item 475: qty 4. Item 476: qty 4. Item 477: qty 2. Item 478: qty 4. Item 479: qty 1. Item 480: qty 10. Item 481: qty 10. Item 482: qty 4. Item 483: qty 4. Item 484: qty 9. Item 485: qty 2. Item 486: qty 3. Item 487: qty 10. Item 488: qty 10. Item 489: qty 7. Item 490: qty 4. Item 491: qty 10. Item 492: qty 9. Item 493: qty 2. Item 494: qty 1. Item 495: qty 4. Item 496: qty 7. Item 497: qty 7. Item 498: qty 2. Item 499: qty 5. Item 500: qty 1. Item 501: qty 5. Item 502: qty 8. Item 503: qty 3. Item 504: qty 1. Item 505: qty 7. Item 506: qty 9. Item 507: qty 3. Item 508: qty 5. Item 509: qty 3. Item 510: qty 10. Item 511: qty 7. Item 512: qty 1. Item 513: qty 5. Item 514: qty 6. Item 515: qty 4. Item 516: qty 8. Item 517: qty 2. Item 518: qty 2. Item 519: qty 8. Item 520: qty 7. Item 521: qty 3. Item 522: qty 9. Item 523: qty 5. Item 524: qty 4. Item 525: qty 3. Item 526: qty 1. Item 527: qty 5. Item 528: qty 9. Item 529: qty 4. Item 530: qty 6. Item 531: qty 6. Item 532: qty 4. Item 533: qty 9. Item 534: qty 2. Item 535: qty 2. Item 536: qty 3. Item 537: qty 8. Item 538: qty 3. Item 539: qty 10. Item 540: qty 1. Item 541: qty 4. Item 542: qty 7. Item 543: qty 1. Item 544: qty 9. Item 545: qty 5. Item 546: qty 1. Item 547: qty 10. Item 548: qty 10. Item 549: qty 4. Item 550: qty 3. Item 551: qty 9. Item 552: qty 3. Item 553: qty 5. Item 554: qty 10. Item 555: qty 9. Item 556: qty 9. Item 557: qty 7. Item 558: qty 3. Item 559: qty 10. Item 560: qty 5. Item 561: qty 5. Item 562: qty 6. Item 563: qty 6. Item 564: qty 8. Item 565: qty 5. Item 566: qty 8. Item 567: qty 7. Item 568: qty 10. Item 569: qty 4. Item 570: qty 8. Item 571: qty 7. Item 572: qty 2. Item 573: qty 1. Item 574: qty 7. Item 575: qty 8. Item 576: qty 5. Item 577: qty 4. Item 578: qty 10. Item 579: qty 4. Item 580: qty 5. Item 581: qty 3. Item 582: qty 2. Item 583: qty 5. Item 584: qty 8. Item 585: qty 9. Item 586: qty 4. Item 587: qty 9. Item 588: qty 6. Item 589: qty 10. Item 590: qty 6. Item 591: qty 5. Item 592: qty 3. Item 593: qty 7. Item 594: qty 3. Item 595: qty 6. Item 596: qty 5. Item 597: qty 8. Item 598: qty 4. Item 599: qty 7. Item 600: qty 3. Item 601: qty 1. Item 602: qty 5. Item 603: qty 10. Item 604: qty 4. Item 605: qty 6. Item 606: qty 1. Item 607: qty 7. Item 608: qty 1. Item 609: qty 3. Item 610: qty 8. Item 611: qty 8. Item 612: qty 4. Item 613: qty 6. Item 614: qty 5. Item 615: qty 7. Item 616: qty 1. Item 617: qty 3. Item 618: qty 10. Item 619: qty 4. Item 620: qty 5. Item 621: qty 7. Item 622: qty 9. Item 623: qty 7. Item 624: qty 2. Item 625: qty 7. Item 626: qty 9. Item 627: qty 10. Item 628: qty 10. Item 629: qty 6. Item 630: qty 1. Item 631: qty 3. Item 632: qty 2. Item 633: qty 10. Item 634: qty 4. Item 635: qty 2. Item 636: qty 1. Item 637: qty 9. Item 638: qty 4. Item 639: qty 6. Item 640: qty 5. Item 641: qty 4. Item 642: qty 9. Item 643: qty 4. Item 644: qty 3. Item 645: qty 10. Item 646: qty 10. Item 647: qty 7. Item 648: qty 3. Item 649: qty 2. Item 650: qty 5. Item 651: qty 4. Item 652: qty 9. Item 653: qty 10. Item 654: qty 4. Item 655: qty 1. Item 656: qty 7. Item 657: qty 8. Item 658: qty 4. Item 659: qty 3. Item 660: qty 8. Item 661: qty 2. Item 662: qty 1. Item 663: qty 7. Item 664: qty 7. Item 665: qty 10. Item 666: qty 3. Item 667: qty 10. Item 668: qty 3. Item 669: qty 2. Item 670: qty 10. Item 671: qty 10. Item 672: qty 5. Item 673: qty 2. Item 674: qty 8. Item 675: qty 4. Item 676: qty 1. Item 677: qty 10. Item 678: qty 7. Item 679: qty 3. Item 680: qty 9. Item 681: qty 10. Item 682: qty 9. Item 683: qty 3. Item 684: qty 10. Item 685: qty 9. Item 686: qty 6. Item 687: qty 1. Item 688: qty 2. Item 689: qty 4. Item 690: qty 9. Item 691: qty 2. Item 692: qty 8. Item 693: qty 4. Item 694: qty 5. Item 695: qty 5. Item 696: qty 10. Item 697: qty 8. Item 698: qty 3. Item 699: qty 1. Item 700: qty 5. Item 701: qty 5. Item 702: qty 8. Item 703: qty 9. Item 704: qty 8. Item 705: qty 4. Item 706: qty 10. Item 707: qty 1. Item 708: qty 7. Item 709: qty 3. Item 710: qty 7. Item 711: qty 3. Item 712: qty 5. Item 713: qty 2. Item 714: qty 5. Item 715: qty 4. Item 716: qty 1. Item 717: qty 4. Item 718: qty 7. Item 719: qty 3. Item 720: qty 9. Item 721: qty 4. Item 722: qty 8. Item 723: qty 1. Item 724: qty 3. Item 725: qty 8. Item 726: qty 10. Item 727: qty 5. Item 728: qty 9. Item 729: qty 1. Item 730: qty 2. Item 731: qty 10. Item 732: qty 6. Item 733: qty 2. Item 734: qty 9. Item 735: qty 7. Item 736: qty 4. Item 737: qty 1. Item 738: qty 3. Item 739: qty 3. Item 740: qty 1. Item 741: qty 6. Item 742: qty 10. Item 743: qty 1. Item 744: qty 4. Item 745: qty 8. Item 746: qty 2. Item 747: qty 5. Item 748: qty 2. Item 749: qty 9. Item 750: qty 1. Item 751: qty 5. Item 752: qty 9. Item 753: qty 9. Item 754: qty 8. Item 755: qty 10. Item 756: qty 3. Item 757: qty 9. Item 758: qty 8. Item 759: qty 6. Item 760: qty 9. Item 761: qty 5. Item 762: qty 9. Item 763: qty 5. Item 764: qty 10. Item 765: qty 1. Item 766: qty 7. Item 767: qty 5. Item 768: qty 7. Item 769: qty 4. Item 770: qty 4. Item 771: qty 5. Item 772: qty 1. Item 773: qty 7. Item 774: qty 2. Item 775: qty 8. Item 776: qty 6. Item 777: qty 5. Item 778: qty 3. Item 779: qty 1. Item 780: qty 8. Item 781: qty 10. Item 782: qty 5. Item 783: qty 6. Item 784: qty 7. Item 785: qty 9. Item 786: qty 9. Item 787: qty 6. Item 788: qty 4. Item 789: qty 1. Item 790: qty 10. Item 791: qty 10. Item 792: qty 4. Item 793: qty 5. Item 794: qty 9. Item 795: qty 1. Item 796: qty 8. Item 797: qty 1. Item 798: qty 10. Item 799: qty 6. Item 800: qty 10. Item 801: qty 7. Item 802: qty 3. Item 803: qty 8. Item 804: qty 10. Item 805: qty 7. Item 806: qty 1. Item 807: qty 10. Item 808: qty 6. Item 809: qty 3. Item 810: qty 1. Item 811: qty 1. Item 812: qty 3. Item 813: qty 7. Item 814: qty 6. Item 815: qty 4. Item 816: qty 5. Item 817: qty 9. Item 818: qty 10. Item 819: qty 2. Item 820: qty 8. Item 821: qty 5. Item 822: qty 2. Item 823: qty 3. Item 824: qty 3. Item 825: qty 2. Item 826: qty 1. Item 827: qty 4. Item 828: qty 4. Item 829: qty 1. Item 830: qty 10. Item 831: qty 8. Item 832: qty 3. Item 833: qty 10. Item 834: qty 4. Item 835: qty 4. Item 836: qty 8. Item 837: qty 6. Item 838: qty 8. Item 839: qty 2. Item 840: qty 3. Item 841: qty 5. Item 842: qty 7. Item 843: qty 5. Item 844: qty 5. Item 845: qty 4. Item 846: qty 1. Item 847: qty 10. Item 848: qty 5. Item 849: qty 7. Item 850: qty 10. Item 851: qty 5. Item 852: qty 6. Item 853: qty 9. Item 854: qty 2. Item 855: qty 8. Item 856: qty 7. Item 857: qty 2. Item 858: qty 3. Item 859: qty 6. Item 860: qty 10. Item 861: qty 4. Item 862: qty 1. Item 863: qty 7. Item 864: qty 3. Item 865: qty 10. Item 866: qty 3. Item 867: qty 7. Item 868: qty 6. Item 869: qty 8. Item 870: qty 3. Item 871: qty 4. Item 872: qty 2. Item 873: qty 1. Item 874: qty 5. Item 875: qty 3. Item 876: qty 7. Item 877: qty 2. Item 878: qty 8. Item 879: qty 8. Item 880: qty 4. Item 881: qty 4. Item 882: qty 8. Item 883: qty 7. Item 884: qty 8. Item 885: qty 2. Item 886: qty 4. Item 887: qty 4. Item 888: qty 4. Item 889: qty 8. Item 890: qty 10. Item 891: qty 5. Item 892: qty 10. Item 893: qty 5. Item 894: qty 10. Item 895: qty 2. Item 896: qty 6. Item 897: qty 4. Item 898: qty 1. Item 899: qty 5. Item 900: qty 4. Item 901: qty 2. Item 902: qty 6. Item 903: qty 1. Item 904: qty 5. Item 905: qty 4. Item 906: qty 9. Item 907: qty 6. Item 908: qty 5. Item 909: qty 10. Item 910: qty 5. Item 911: qty 4. Item 912: qty 2. Item 913: qty 9. Item 914: qty 9. Item 915: qty 10. Item 916: qty 4. Item 917: qty 7. Item 918: qty 3. Item 919: qty 7. Item 920: qty 1. Item 921: qty 10. Item 922: qty 7. Item 923: qty 2. Item 924: qty 3. Item 925: qty 3. Item 926: qty 8. Item 927: qty 4. Item 928: qty 6. Item 929: qty 7. Item 930: qty 6. Item 931: qty 1. Item 932: qty 4. Item 933: qty 7. Item 934: qty 6. Item 935: qty 1. Item 936: qty 9. Item 937: qty 7. Item 938: qty 6. Item 939: qty 10. Item 940: qty 10. Item 941: qty 8. Item 942: qty 5. Item 943: qty 3. Item 944: qty 3. Item 945: qty 3. Item 946: qty 3. Item 947: qty 6. Item 948: qty 9. Item 949: qty 8. Item 950: qty 1. Item 951: qty 4. Item 952: qty 1. Item 953: qty 4. Item 954: qty 10. Item 955: qty 1. Item 956: qty 2. Item 957: qty 2. Item 958: qty 5. Item 959: qty 9. Item 960: qty 7. Item 961: qty 3. Item 962: qty 3. Item 963: qty 9. Item 964: qty 2. Item 965: qty 4. Item 966: qty 6. Item 967: qty 6. Item 968: qty 2. Item 969: qty 3. Item 970: qty 4. Item 971: qty 4. Item 972: qty 2. Item 973: qty 10. Item 974: qty 10. Item 975: qty 9. Item 976: qty 1. Item 977: qty 10. Item 978: qty 10. Item 979: qty 9. Item 980: qty 10. Item 981: qty 6. Item 982: qty 5. Item 983: qty 1. Item 984: qty 8. Item 985: qty 8. Item 986: qty 5. Item 987: qty 1. Item 988: qty 9. Item 989: qty 5. Item 990: qty 4. Item 991: qty 9. Item 992: qty 8. Item 993: qty 5. Item 994: qty 9. Item 995: qty 6. Item 996: qty 4. Item 997: qty 5. Item 998: qty 7. Item 999: qty 3. Item 1000: qty 8. Item 1001: qty 7. Item 1002: qty 1. Item 1003: qty 6. Item 1004: qty 1. Item 1005: qty 10. Item 1006: qty 3. Item 1007: qty 10. Item 1008: qty 7. Item 1009: qty 1. Item 1010: qty 1. Item 1011: qty 3. Item 1012: qty 10. Item 1013: qty 2. Item 1014: qty 4. Item 1015: qty 8. Item 1016: qty 1. Item 1017: qty 6. Item 1018: qty 10. Item 1019: qty 4. Item 1020: qty 7. Item 1021: qty 6. Item 1022: qty 7. Item 1023: qty 7. Item 1024: qty 2. Item 1025: qty 7. Item 1026: qty 7. Item 1027: qty 6. Item 1028: qty 8. Item 1029: qty 5. Item 1030: qty 4. Item 1031: qty 6. Item 1032: qty 8. Item 1033: qty 8. Item 1034: qty 8. Item 1035: qty 7. Item 1036: qty 10. Item 1037: qty 10. Item 1038: qty 3. Item 1039: qty 5. Item 1040: qty 8. Item 1041: qty 2. Item 1042: qty 3. Item 1043: qty 7. Item 1044: qty 1. Item 1045: qty 10. Item 1046: qty 4. Item 1047: qty 2. Item 1048: qty 10. Item 1049: qty 10. Item 1050: qty 2. Item 1051: qty 10. Item 1052: qty 2. Item 1053: qty 10. Item 1054: qty 10. Item 1055: qty 10. Item 1056: qty 6. Item 1057: qty 10. Item 1058: qty 2. Item 1059: qty 5. Item 1060: qty 5. Item 1061: qty 8. Item 1062: qty 3. Item 1063: qty 5. Item 1064: qty 2. Item 1065: qty 4. Item 1066: qty 1. Item 1067: qty 1. Item 1068: qty 3. Item 1069: qty 6. Item 1070: qty 5. Item 1071: qty 9. Item 1072: qty 4. Item 1073: qty 10. Item 1074: qty 8. Item 1075: qty 7. Item 1076: qty 2. Item 1077: qty 3. Item 1078: qty 10. Item 1079: qty 7. Item 1080: qty 9. Item 1081: qty 9. Item 1082: qty 2. Item 1083: qty 4. Item 1084: qty 9. Item 1085: qty 7. Item 1086: qty 5. Item 1087: qty 5. Item 1088: qty 1. Item 1089: qty 10. Item 1090: qty 2. Item 1091: qty 8. Item 1092: qty 8. Item 1093: qty 2. Item 1094: qty 1. Item 1095: qty 3. Item 1096: qty 8. Item 1097: qty 9. Item 1098: qty 9. Item 1099: qty 4. Item 1100: qty 10. Item 1101: qty 7. Item 1102: qty 3. Item 1103: qty 6. Item 1104: qty 1. Item 1105: qty 2. Item 1106: qty 5. Item 1107: qty 1. Item 1108: qty 4. Item 1109: qty 1. Item 1110: qty 6. Item 1111: qty 9. Item 1112: qty 7. Item 1113: qty 6. Item 1114: qty 7. Item 1115: qty 2. Item 1116: qty 9. Item 1117: qty 8. Item 1118: qty 7. Item 1119: qty 1. Item 1120: qty 9. Item 1121: qty 8. Item 1122: qty 8. Item 1123: qty 4. Item 1124: qty 8. Item 1125: qty 5. Item 1126: qty 6. Item 1127: qty 3. Item 1128: qty 5. Item 1129: qty 3. Item 1130: qty 8. Item 1131: qty 7. Item 1132: qty 8. Item 1133: qty 10. Item 1134: qty 6. Item 1135: qty 4. Item 1136: qty 9. Item 1137: qty 2. Item 1138: qty 6. Item 1139: qty 10. Item 1140: qty 5. Item 1141: qty 1. Item 1142: qty 5. Item 1143: qty 5. Item 1144: qty 8. Item 1145: qty 1. Item 1146: qty 4. Item 1147: qty 6. Item 1148: qty 3. Item 1149: qty 3. Item 1150: qty 8. Item 1151: qty 4. Item 1152: qty 4. Item 1153: qty 7. Item 1154: qty 5. Item 1155: qty 7. Item 1156: qty 4. Item 1157: qty 10. Item 1158: qty 4. Item 1159: qty 10. Item 1160: qty 9. Item 1161: qty 5. Item 1162: qty 7. Item 1163: qty 7. Item 1164: qty 5. Item 1165: qty 9. Item 1166: qty 10. Item 1167: qty 10. Item 1168: qty 3. Item 1169: qty 9. Item 1170: qty 8. Item 1171: qty 6. Item 1172: qty 8. Item 1173: qty 3. Item 1174: qty 1. Item 1175: qty 3. Item 1176: qty 8. Item 1177: qty 10. Item 1178: qty 1. Item 1179: qty 5. Item 1180: qty 5. Item 1181: qty 7. Item 1182: qty 3. Item 1183: qty 7. Item 1184: qty 7. Item 1185: qty 7. Item 1186: qty 7. Item 1187: qty 10. Item 1188: qty 5. Item 1189: qty 5. Item 1190: qty 5. Item 1191: qty 5. Item 1192: qty 3. Item 1193: qty 9. Item 1194: qty 5. Item 1195: qty 6. Item 1196: qty 1. Item 1197: qty 9. Item 1198: qty 3. Item 1199: qty 7. Item 1200: qty 8. Item 1201: qty 3. Item 1202: qty 7. Item 1203: qty 6. Item 1204: qty 1. Item 1205: qty 5. Item 1206: qty 10. Item 1207: qty 2. Item 1208: qty 8. Item 1209: qty 8. Item 1210: qty 5. Item 1211: qty 5. Item 1212: qty 5. Item 1213: qty 7. Item 1214: qty 3. Item 1215: qty 7. Item 1216: qty 3. Item 1217: qty 6. Item 1218: qty 4. Item 1219: qty 5. Item 1220: qty 4. Item 1221: qty 7. Item 1222: qty 2. Item 1223: qty 2. Item 1224: qty 2. Item 1225: qty 5. Item 1226: qty 4. Item 1227: qty 6. Item 1228: qty 1. Item 1229: qty 4. Item 1230: qty 8. Item 1231: qty 4. Item 1232: qty 4. Item 1233: qty 2. Item 1234: qty 10. Item 1235: qty 9. Item 1236: qty 5. Item 1237: qty 9. Item 1238: qty 2. Item 1239: qty 5. Item 1240: qty 10. Item 1241: qty 5. Item 1242: qty 10. Item 1243: qty 3. Item 1244: qty 1. Item 1245: qty 9. Item 1246: qty 3. Item 1247: qty 6. Item 1248: qty 5. Item 1249: qty 8. Item 1250: qty 6. Item 1251: qty 6. Item 1252: qty 4. Item 1253: qty 2. Item 1254: qty 4. Item 1255: qty 3. Item 1256: qty 3. Item 1257: qty 3. Item 1258: qty 7. Item 1259: qty 2. Item 1260: qty 3. Item 1261: qty 10. Item 1262: qty 4. Item 1263: qty 1. Item 1264: qty 4. Item 1265: qty 2. Item 1266: qty 5. Item 1267: qty 10. Item 1268: qty 6. Item 1269: qty 1. Item 1270: qty 6. Item 1271: qty 4. Item 1272: qty 2. Item 1273: qty 7. Item 1274: qty 1. Item 1275: qty 6. Item 1276: qty 9. Item 1277: qty 4. Item 1278: qty 4. Item 1279: qty 6. Item 1280: qty 3. Item 1281: qty 3. Item 1282: qty 8. Item 1283: qty 9. Item 1284: qty 7. Item 1285: qty 2. Item 1286: qty 5. Item 1287: qty 2. Item 1288: qty 2. Item 1289: qty 5. Item 1290: qty 7. Item 1291: qty 1. Item 1292: qty 9. Item 1293: qty 1. Item 1294: qty 5. Item 1295: qty 10. Item 1296: qty 4. Item 1297: qty 6. Item 1298: qty 1. Item 1299: qty 4. Item 1300: qty 3. Item 1301: qty 5. Item 1302: qty 5. Item 1303: qty 10. Item 1304: qty 8. Item 1305: qty 7. Item 1306: qty 6. Item 1307: qty 5. Item 1308: qty 4. Item 1309: qty 5. Item 1310: qty 7. Item 1311: qty 10. Item 1312: qty 8. Item 1313: qty 9. Item 1314: qty 4. Item 1315: qty 6. Item 1316: qty 10. Item 1317: qty 9. Item 1318: qty 8. Item 1319: qty 2. Item 1320: qty 7. Item 1321: qty 5. Item 1322: qty 9. Item 1323: qty 6. Item 1324: qty 1. Item 1325: qty 2. Item 1326: qty 7. Item 1327: qty 5. Item 1328: qty 9. Item 1329: qty 10. Item 1330: qty 7. Item 1331: qty 10. Item 1332: qty 6. Item 1333: qty 3. Item 1334: qty 9. Item 1335: qty 7. Item 1336: qty 8. Item 1337: qty 2. Item 1338: qty 7. Item 1339: qty 3. Item 1340: qty 5. Item 1341: qty 3. Item 1342: qty 1. Item 1343: qty 2. Item 1344: qty 4. Item 1345: qty 9. Item 1346: qty 4. Item 1347: qty 6. Item 1348: qty 10. Item 1349: qty 9. Item 1350: qty 5. Item 1351: qty 8. Item 1352: qty 2. Item 1353: qty 7. Item 1354: qty 4. Item 1355: qty 9. Item 1356: qty 9. Item 1357: qty 1. Item 1358: qty 2. Item 1359: qty 4. Item 1360: qty 4. Item 1361: qty 6. Item 1362: qty 4. Item 1363: qty 1. Item 1364: qty 2. Item 1365: qty 5. Item 1366: qty 1. Item 1367: qty 9. Item 1368: qty 5. Item 1369: qty 4. Item 1370: qty 8. Item 1371: qty 2. Item 1372: qty 8. Item 1373: qty 4. Item 1374: qty 5. Item 1375: qty 9. Item 1376: qty 8. Item 1377: qty 10. Item 1378: qty 1. Item 1379: qty 4. Item 1380: qty 7. Item 1381: qty 2. Item 1382: qty 7. Item 1383: qty 7. Item 1384: qty 3. Item 1385: qty 10. Item 1386: qty 6. Item 1387: qty 9. Item 1388: qty 2. Item 1389: qty 6. Item 1390: qty 3. Item 1391: qty 6. Item 1392: qty 9. Item 1393: qty 1. Item 1394: qty 8. Item 1395: qty 3. Item 1396: qty 5. Item 1397: qty 9. Item 1398: qty 3. Item 1399: qty 6. Item 1400: qty 10. Item 1401: qty 4. Item 1402: qty 2. Item 1403: qty 8. Item 1404: qty 8. Item 1405: qty 5. Item 1406: qty 9. Item 1407: qty 8. Item 1408: qty 4. Item 1409: qty 9. Item 1410: qty 6. Item 1411: qty 10. Item 1412: qty 1. Item 1413: qty 5. Item 1414: qty 8. Item 1415: qty 3. Item 1416: qty 4. Item 1417: qty 8. Item 1418: qty 1. Item 1419: qty 10. Item 1420: qty 1. Item 1421: qty 3. Item 1422: qty 2. Item 1423: qty 7. Item 1424: qty 4. Item 1425: qty 5. Item 1426: qty 2. Item 1427: qty 6. Item 1428: qty 8. Item 1429: qty 9. Item 1430: qty 9. Item 1431: qty 1. Item 1432: qty 6. Item 1433: qty 7. Item 1434: qty 3. Item 1435: qty 5. Item 1436: qty 8. Item 1437: qty 3. Item 1438: qty 3. Item 1439: qty 8. Item 1440: qty 10. Item 1441: qty 9. Item 1442: qty 2. Item 1443: qty 10. Item 1444: qty 10. Item 1445: qty 4. Item 1446: qty 3. Item 1447: qty 2. Item 1448: qty 8. Item 1449: qty 10. Item 1450: qty 6. Item 1451: qty 4. Item 1452: qty 6. Item 1453: qty 4. Item 1454: qty 3. Item 1455: qty 4. Item 1456: qty 5. Item 1457: qty 5. Item 1458: qty 1. Item 1459: qty 1. Item 1460: qty 10. Item 1461: qty 7. Item 1462: qty 1. Item 1463: qty 2. Item 1464: qty 8. Item 1465: qty 4. Item 1466: qty 5. Item 1467: qty 7. Item 1468: qty 1. Item 1469: qty 5. Item 1470: qty 5. Item 1471: qty 2. Item 1472: qty 4. Item 1473: qty 1. Item 1474: qty 2. Item 1475: qty 7. Item 1476: qty 8. Item 1477: qty 6. Item 1478: qty 9. Item 1479: qty 3. Item 1480: qty 1. Item 1481: qty 7. Item 1482: qty 2. Item 1483: qty 7. Item 1484: qty 2. Item 1485: qty 3. Item 1486: qty 1. Item 1487: qty 8. Item 1488: qty 6. Item 1489: qty 2. Item 1490: qty 10. Item 1491: qty 2. Item 1492: qty 10. Item 1493: qty 9. Item 1494: qty 7. Item 1495: qty 10. Item 1496: qty 4. Item 1497: qty 2. Item 1498: qty 1. Item 1499: qty 8. Item 1500: qty 2. Item 1501: qty 5. Item 1502: qty 5. Item 1503: qty 9. Item 1504: qty 9. Item 1505: qty 5. Item 1506: qty 5. Item 1507: qty 2. Item 1508: qty 3. Item 1509: qty 1. Item 1510: qty 5. Item 1511: qty 3. Item 1512: qty 10. Item 1513: qty 10. Item 1514: qty 1. Item 1515: qty 2. Item 1516: qty 9. Item 1517: qty 5. Item 1518: qty 6. Item 1519: qty 4. Item 1520: qty 4. Item 1521: qty 9. Item 1522: qty 2. Item 1523: qty 3. Item 1524: qty 8. Item 1525: qty 9. Item 1526: qty 10. Item 1527: qty 2. Item 1528: qty 8. Item 1529: qty 4. Item 1530: qty 9. Item 1531: qty 2. Item 1532: qty 4. Item 1533: qty 4. Item 1534: qty 5. Item 1535: qty 5. Item 1536: qty 9. Item 1537: qty 3. Item 1538: qty 9. Item 1539: qty 9. Item 1540: qty 8. Item 1541: qty 4. Item 1542: qty 5. Item 1543: qty 1. Item 1544: qty 3. Item 1545: qty 3. Item 1546: qty 7. Item 1547: qty 5. Item 1548: qty 6. Item 1549: qty 10. Item 1550: qty 9. Item 1551: qty 2. Item 1552: qty 10. Item 1553: qty 5. Item 1554: qty 6. Item 1555: qty 6. Item 1556: qty 9. Item 1557: qty 8. Item 1558: qty 6. Item 1559: qty 10. Item 1560: qty 3. Item 1561: qty 6. Item 1562: qty 8. Item 1563: qty 5. Item 1564: qty 2. Item 1565: qty 4. Item 1566: qty 2. Item 1567: qty 1. Item 1568: qty 1. Item 1569: qty 2. Item 1570: qty 7. Item 1571: qty 9. Item 1572: qty 2. Item 1573: qty 4. Item 1574: qty 6. Item 1575: qty 5. Item 1576: qty 6. Item 1577: qty 7. Item 1578: qty 9. Item 1579: qty 8. Item 1580: qty 3. Item 1581: qty 1. Item 1582: qty 7. Item 1583: qty 7. Item 1584: qty 4. Item 1585: qty 3. Item 1586: qty 3. Item 1587: qty 7. Item 1588: qty 7. Item 1589: qty 3. Item 1590: qty 1. Item 1591: qty 7. Item 1592: qty 2. Item 1593: qty 3. Item 1594: qty 1. Item 1595: qty 8. Item 1596: qty 6. Item 1597: qty 7. Item 1598: qty 4. Item 1599: qty 6. Item 1600: qty 9. Item 1601: qty 5. Item 1602: qty 6. Item 1603: qty 7.
+
+I see no quantity of 20. The maximum I see is 10. Actually many are 10. None are 11-20. So discount table covers all quantities (1-10). Since qty max is 10, all are in [1,4], [5,9], or [10,19] (specifically 10). So discount is defined.
+
+Now we need to check line_total = quantity * unit_price * (1 - discount). Let's verify a few to see if any mismatch.
+
+But doing all 1603 manually is impossible. We need to find if there's any obvious violation or perhaps the state is legal. But given the complexity, maybe there is a specific error.
+
+Let's check the order totals. Maybe some order total doesn't match sum(line_total)*(1+tax). We can compute for a few orders to see.
+
+First, need tax rates:
+DE: 0.19
+FR: 0.20
+GB: 0.20
+JP: 0.10
+US: 0.08
+OTHER: 0.15
+
+Discount table:
+bronze: [1,4]:0.00, [5,9]:0.05, [10,19]:0.07
+silver: [1,4]:0.05, [5,9]:0.10, [10,19]:0.12
+gold: [1,4]:0.10, [5,9]:0.15, [10,19]:0.20
+
+Let's compute for order 1:
+Customer 1 is FR, bronze.
+Order 1 total: 9027.6522
+Items:
+1: qty2, unit 227.49. qty in [1,4], bronze discount 0.00. line_total = 2*227.49 = 454.98. Matches CSV.
+2: qty4, unit 405.79. discount 0.00. 4*405.79=1623.16. Matches.
+3: qty1, unit 412.06. 412.06. Matches.
+4: qty8, unit 212.88. discount 0.05. 8*212.88*(0.95) = 8*212.88=1703.04; *0.95=1617.888. Matches.
+5: qty6, unit 333.81. discount 0.05. 6*333.81=2002.86; *0.95=1902.717. Matches.
+6: qty9, unit 85.03. discount 0.05. 9*85.03=765.27; *0.95=727.0065. Matches.
+7: qty6, unit 137.76. discount 0.05. 6*137.76=826.56; *0.95=785.232. Matches.
+Sum line_total = 454.98+1623.16+412.06+1617.888+1902.717+727.0065+785.232 = let's add:
+454.98+1623.16=2078.14
++412.06=2490.2
++1617.888=4108.088
++1902.717=6010.805
++727.0065=6737.8115
++785.232=7523.0435
+Tax for FR: 0.20. So order total = 7523.0435 * 1.20 = 9027.6522. Exactly matches! So order 1 is correct.
+
+Let's check order 2:
+Customer 1, FR, bronze.
+Items:
+8: qty8, 233.51, disc 0.05. 8*233.51=1868.08; *0.95=1774.676. OK.
+9: qty9, 318.68, disc 0.05. 9*318.68=2868.12; *0.95=2724.714. OK.
+10: qty5, 175.92, disc 0.05. 5*175.92=879.6; *0.95=835.62. OK.
+11: qty4, 345.93, disc 0.00. 4*345.93=1383.72. OK.
+12: qty8, 140.21, disc 0.05. 8*140.21=1121.68; *0.95=1065.596. OK.
+13: qty1, 264.17, disc 0.00. 264.17. OK.
+14: qty9, 128.57, disc 0.05. 9*128.57=1157.13; *0.95=1099.2735. OK.
+15: qty5, 81.56, disc 0.05. 5*81.56=407.8; *0.95=387.41. OK.
+16: qty3, 273.52, disc 0.00. 820.56. OK.
+17: qty8, 430.64, disc 0.05. 8*430.64=3445.12; *0.95=3272.864. OK.
+18: qty2, 90.0, disc 0.00. 180.0. OK.
+Sum: 1774.676+2724.714=4499.39
++835.62=5335.01
++1383.72=6718.73
++1065.596=7784.326
++264.17=8048.496
++1099.2735=9147.7695
++387.41=9535.1795
++820.56=10355.7395
++3272.864=13628.6035
++180=13808.6035
+Tax 1.20: *1.2 = 16570.3242. Matches order 2 total. Good.
+
+So derivation seems correct for first two. We need to check if any order is wrong. Given the data is likely generated by a script, maybe all are correct. But we must be sure.
+
+Let's check a gold customer, e.g., order 11:
+Customer 5 is GB, gold.
+Order 11 total: 2734.668
+Items:
+119: qty1, 223.94. gold, qty1 -> disc 0.10. line = 1*223.94*0.9 = 201.546. OK.
+120: qty2, 102.82. disc 0.10. 2*102.82*0.9 = 185.076. OK.
+121: qty2, 49.11. disc 0.10. 2*49.11*0.9 = 88.398. OK.
+122: qty4, 308.01. disc 0.10. 4*308.01*0.9 = 1108.836. OK.
+123: qty3, 162.51. disc 0.10. 3*162.51*0.9 = 438.777. OK.
+124: qty1, 284.73. disc 0.10. 1*284.73*0.9 = 256.257. OK.
+Sum = 201.546+185.076+88.398+1108.836+438.777+256.257 = let's add:
+201.546+185.076=386.622
++88.398=475.02
++1108.836=1583.856
++438.777=2022.633
++256.257=2278.89
+Tax for GB: 0.20. Total = 2278.89 * 1.2 = 2734.668. Matches.
+
+So derivation is likely correct across the board. But we need to check if any line_total is wrong or any order total is wrong. Given the first few match exactly, it's likely all are correct. However, there might be a subtle error: e.g., a line with quantity 10 and tier bronze should have discount 0.07. Let's check if any such line exists and if line_total matches.
+
+For example, order 3 has item 22: qty10, unit 483.53, customer 1 bronze. Discount 0.07. line_total = 10*483.53*(0.93) = 4835.3*0.93 = 4496.829. CSV says 4496.829. Good.
+
+Another: order 15 (customer 7, gold) has items with qty 10? Let's see. Order 15 items 150-169. Customer 7 is GB, gold. Item 181: qty10, unit 149.5. gold qty10 -> disc 0.20. line = 10*149.5*0.8 = 1196.0. CSV says 1196.0. Good.
+
+So derivation seems solid.
+
+Now status transition. Let's examine the allowed pairs:
+(pending, shipped)
+(shipped, delivered)
+(pending, cancelled)
+(pending, pending)
+
+In the orders data, we see prev_status values:
+- empty (for initial pending)
+- pending
+- shipped
+
+And status values:
+- delivered
+- shipped
+- cancelled
+- pending
+
+Let's check each order's pair:
+
+Order 1: prev shipped, status delivered -> allowed.
+Order 2: prev shipped, status delivered -> allowed.
+Order 3: prev pending, status shipped -> allowed.
+Order 4: prev pending, status cancelled -> allowed.
+Order 5: prev shipped, status delivered -> allowed.
+Order 6: prev pending, status cancelled -> allowed.
+Order 7: prev pending, status shipped -> allowed.
+Order 8: prev empty, status pending -> ??? Not in allowed set if empty is not 'pending'.
+Order 9: prev pending, status shipped -> allowed.
+Order 10: prev pending, status cancelled -> allowed.
+Order 11: prev empty, status pending -> ???
+Order 12: prev empty, status pending -> ???
+Order 13: prev pending, status cancelled -> allowed.
+Order 14: prev pending, status cancelled -> allowed.
+Order 15: prev shipped, status delivered -> allowed.
+Order 16: prev shipped, status delivered -> allowed.
+Order 17: prev pending, status cancelled -> allowed.
+Order 18: prev empty, status pending -> ???
+Order 19: prev shipped, status delivered -> allowed.
+Order 20: prev shipped, status delivered -> allowed.
+Order 21: prev empty, status pending -> ???
+Order 22: prev shipped, status delivered -> allowed.
+Order 23: prev empty, status pending -> ???
+Order 24: prev pending, status shipped -> allowed.
+Order 25: prev shipped, status delivered -> allowed.
+Order 26: prev shipped, status delivered -> allowed.
+Order 27: prev shipped, status delivered -> allowed.
+Order 28: prev pending, status shipped -> allowed.
+Order 29: prev pending, status shipped -> allowed.
+Order 30: prev shipped, status delivered -> allowed.
+Order 31: prev empty, status pending -> ???
+Order 32: prev pending, status cancelled -> allowed.
+Order 33: prev shipped, status delivered -> allowed.
+Order 34: prev pending, status shipped -> allowed.
+Order 35: prev empty, status pending -> ???
+Order 36: prev shipped, status delivered -> allowed.
+Order 37: prev pending, status cancelled -> allowed.
+Order 38: prev pending, status shipped -> allowed.
+Order 39: prev pending, status shipped -> allowed.
+Order 40: prev shipped, status delivered -> allowed.
+Order 41: prev pending, status cancelled -> allowed.
+Order 42: prev shipped, status delivered -> allowed.
+Order 43: prev shipped, status delivered -> allowed.
+Order 44: prev empty, status pending -> ???
+Order 45: prev pending, status cancelled -> allowed.
+Order 46: prev empty, status pending -> ???
+Order 47: prev shipped, status delivered -> allowed.
+Order 48: prev shipped, status delivered -> allowed.
+Order 49: prev pending, status shipped -> allowed.
+Order 50: prev empty, status pending -> ???
+Order 51: prev pending, status cancelled -> allowed.
+Order 52: prev shipped, status delivered -> allowed.
+Order 53: prev shipped, status delivered -> allowed.
+Order 54: prev shipped, status delivered -> allowed.
+Order 55: prev shipped, status delivered -> allowed.
+Order 56: prev empty, status pending -> ???
+Order 57: prev shipped, status delivered -> allowed.
+Order 58: prev pending, status cancelled -> allowed.
+Order 59: prev pending, status cancelled -> allowed.
+Order 60: prev pending, status cancelled -> allowed.
+Order 61: prev shipped, status delivered -> allowed.
+Order 62: prev shipped, status delivered -> allowed.
+Order 63: prev pending, status cancelled -> allowed.
+Order 64: prev pending, status shipped -> allowed.
+Order 65: prev shipped, status delivered -> allowed.
+Order 66: prev shipped, status delivered -> allowed.
+Order 67: prev empty, status pending -> ???
+Order 68: prev pending, status shipped -> allowed.
+Order 69: prev empty, status pending -> ???
+Order 70: prev shipped, status delivered -> allowed.
+Order 71: prev pending, status cancelled -> allowed.
+Order 72: prev shipped, status delivered -> allowed.
+Order 73: prev shipped, status delivered -> allowed.
+Order 74: prev shipped, status delivered -> allowed.
+Order 75: prev shipped, status delivered -> allowed.
+Order 76: prev shipped, status delivered -> allowed.
+Order 77: prev shipped, status delivered -> allowed.
+Order 78: prev pending, status shipped -> allowed.
+Order 79: prev shipped, status delivered -> allowed.
+Order 80: prev shipped, status delivered -> allowed.
+Order 81: prev shipped, status delivered -> allowed.
+Order 82: prev pending, status cancelled -> allowed.
+Order 83: prev pending, status shipped -> allowed.
+Order 84: prev pending, status shipped -> allowed.
+Order 85: prev empty, status pending -> ???
+Order 86: prev empty, status pending -> ???
+Order 87: prev pending, status cancelled -> allowed.
+Order 88: prev shipped, status delivered -> allowed.
+Order 89: prev pending, status shipped -> allowed.
+Order 90: prev shipped, status delivered -> allowed.
+Order 91: prev empty, status pending -> ???
+Order 92: prev pending, status shipped -> allowed.
+Order 93: prev pending, status cancelled -> allowed.
+Order 94: prev pending, status cancelled -> allowed.
+Order 95: prev empty, status pending -> ???
+Order 96: prev empty, status pending -> ???
+Order 97: prev empty, status pending -> ???
+Order 98: prev shipped, status delivered -> allowed.
+Order 99: prev pending, status cancelled -> allowed.
+Order 100: prev pending, status cancelled -> allowed.
+Order 101: prev pending, status shipped -> allowed.
+Order 102: prev shipped, status delivered -> allowed.
+Order 103: prev pending, status cancelled -> allowed.
+Order 104: prev shipped, status delivered -> allowed.
+Order 105: prev shipped, status delivered -> allowed.
+Order 106: prev shipped, status delivered -> allowed.
+Order 107: prev shipped, status delivered -> allowed.
+Order 108: prev empty, status pending -> ???
+Order 109: prev empty, status pending -> ???
+Order 110: prev empty, status pending -> ???
+Order 111: prev pending, status cancelled -> allowed.
+Order 112: prev shipped, status delivered -> allowed.
+Order 113: prev shipped, status delivered -> allowed.
+Order 114: prev shipped, status delivered -> allowed.
+Order 115: prev empty, status pending -> ???
+Order 116: prev pending, status shipped -> allowed.
+Order 117: prev empty, status pending -> ???
+Order 118: prev pending, status shipped -> allowed.
+Order 119: prev empty, status pending -> ???
+Order 120: prev shipped, status delivered -> allowed.
+Order 121: prev pending, status cancelled -> allowed.
+Order 122: prev shipped, status delivered -> allowed.
+Order 123: prev pending, status shipped -> allowed.
+Order 124: prev empty, status pending -> ???
+Order 125: prev shipped, status delivered -> allowed.
+Order 126: prev empty, status pending -> ???
+Order 127: prev shipped, status delivered -> allowed.
+Order 128: prev shipped, status delivered -> allowed.
+Order 129: prev shipped, status delivered -> allowed.
+Order 130: prev empty, status pending -> ???
+Order 131: prev pending, status shipped -> allowed.
+Order 132: prev shipped, status delivered -> allowed.
+Order 133: prev pending, status cancelled -> allowed.
+Order 134: prev pending, status shipped -> allowed.
+Order 135: prev empty, status pending -> ???
+Order 136: prev pending, status shipped -> allowed.
+Order 137: prev shipped, status delivered -> allowed.
+Order 138: prev pending, status shipped -> allowed.
+Order 139: prev shipped, status delivered -> allowed.
+Order 140: prev pending, status cancelled -> allowed.
+Order 141: prev shipped, status delivered -> allowed.
+Order 142: prev pending, status cancelled -> allowed.
+Order 143: prev pending, status cancelled -> allowed.
+Order 144: prev empty, status pending -> ???
+Order 145: prev empty, status pending -> ???
+Order 146: prev pending, status cancelled -> allowed.
+Order 147: prev empty, status pending -> ???
+Order 148: prev pending, status shipped -> allowed.
+Order 149: prev empty, status pending -> ???
+Order 150: prev empty, status pending -> ???
+Order 151: prev pending, status shipped -> allowed.
+
+So many orders have empty prev_status and status pending. The natural language rule says the pair must be in the allowed set. Empty is not 'pending'. So this would be a transition_break.
+
+But is empty string considered NULL, and is (NULL, pending) allowed? The trigger code suggests that the initial state is represented by (pending,pending). But the data has empty. This could be a data loading artifact: in CSV, NULL is represented as empty. The trigger uses ARRAY[NEW.prev_status, NEW.status] = ANY(allowed). If prev_status is NULL, the comparison returns NULL, and IF NOT NULL is false, so no exception. Thus the trigger would allow it. However, the problem statement explicitly says: "Status transition: the pair (prev_status, status) of every order lies in the allowed set ...". It does not say "as enforced by the trigger". It says the pair must lie in that set. So empty prev_status is not in the set.
+
+But wait, maybe the blank in CSV is meant to be the string 'pending'? No, other rows have explicit 'pending' in prev_status (e.g., order 3: prev_status pending). So blank is distinct from 'pending'. Thus it's likely a violation.
+
+However, the problem might consider blank as NULL and the allowed set includes (NULL, pending) implicitly as initial state? The trigger comment says: "['pending', 'pending'] -- initial state". So the trigger defines initial state as prev_status='pending', status='pending'. But the data has prev_status empty for initial state. This is a mismatch between the data and the trigger. Since the classification is based on the rules given (including the trigger and the natural language), which one takes precedence? The problem says: "A state is LEGAL iff every one of the following holds." and lists four checks. The status transition check is defined as the pair lying in the allowed set. So blank is a violation.
+
+But is there any other violation? Let's check if any order has prev_status empty and status not pending. Looking through, all empty prev_status have status pending. So it's just the initial state representation.
+
+Now, could there be a cardinality violation we missed? Let's double-check per-customer open orders. I counted manually. Let's verify customer 36: orders 107(delivered),108(pending),109(pending),110(pending). That's 3 open. OK. Customer 39: orders 117(pending),118(shipped),119(pending). That's 3 open. OK. Customer 44: orders 133(cancelled),134(shipped),135(pending),136(shipped). Open: 134,135,136 = 3. OK. Customer 49: orders 146(cancelled),147(pending),148(shipped),149(pending). Open: 147,148,149 = 3. OK. Customer 31: orders 93(cancelled),94(cancelled),95(pending),96(pending),97(pending). Open: 3. OK.
+
+So cardinality is fine.
+
+Now, is there any referential integrity issue? Let's check if any order_items.order_id not in orders.id. Orders go up to 151. Items have order_id up to 151. But is there any order with no items? The per-order item count must be 1-20. We counted each order has at least 1 item. So FK from items to orders is fine. But FK from orders to customers: all customer_ids are between 1 and 50. Customers exist. So FK is fine.
+
+Thus the only potential violation is transition_break due to empty prev_status.
+
+But wait, the problem says "the pair (prev_status, status) of every order lies in the allowed set". If prev_status is NULL, does the pair (NULL, pending) "lie in" the set? In set notation, no. However, in database terms, NULL is not equal to 'pending'. So it's not in the set.
+
+But maybe the empty string in CSV is loaded as NULL, and the trigger is the actual enforcement mechanism. The problem says "Status transition: the pair (prev_status, status) of every order lies in the allowed set ...". This is a direct restatement of the trigger's rule? The trigger's allowed set includes ['pending','pending'] as initial state. The data uses NULL for initial prev_status. The trigger would not fire because of NULL handling. But the natural language rule says the pair must be in the set. This is ambiguous.
+
+Let's read the problem statement carefully:
+
+"3. A natural-language description of the procedural rules that live in application code (line- and order-total derivation formulas, per-customer open-order limit).
+4. A database state, presented as the contents of three CSV files (customers, orders, order_items).
+
+Your task: classify the state as LEGAL or ILLEGAL.
+
+A state is LEGAL iff every one of the following holds. A single violation makes the state ILLEGAL:
+
+- Referential integrity: every orders.customer_id occurs in customers.id; every order_items.order_id occurs in orders.id.
+- Cardinality: each order has 1-20 line items; each customer has at most 3 open orders (status in {pending, shipped}).
+- Derivation:
+    line_total  = quantity * unit_price * (1 - discount(tier, quantity))
+    order.total = sum(line_total over its items) * (1 + tax(country))
+  with the discount and tax functions as specified in the rules block.
+- Status transition: the pair (prev_status, status) of every order lies in
+    the allowed set
+    {(pending, shipped), (shipped, delivered),
+     (pending, cancelled), (pending, pending)}."
+
+So the status transition rule is explicitly given as that set. It does not mention NULL. So empty prev_status violates it.
+
+But is there any order where prev_status is empty but status is not pending? No. So the violation is that many orders have (NULL, pending) not in set.
+
+However, maybe the blank in CSV is meant to represent the value 'pending'? But order 3 has prev_status 'pending', not blank. So blank is distinct.
+
+Alternatively, maybe the problem expects that blank prev_status is treated as 'pending' for the purpose of the pair? But that would be inconsistent with the explicit allowed set. The allowed set includes (pending,pending). If blank is treated as pending, then it's allowed. But why would blank be treated as pending? In the trigger, the initial state is (pending,pending). The data generator might have used NULL for initial prev_status, but the trigger expects 'pending'. This could be a deliberate inconsistency to test if we catch it.
+
+Let's consider the possibility that there is a derivation error somewhere. Maybe one line_total is off by a cent due to rounding. The totals are given with many decimal places. Let's check a few more orders to see if any mismatch.
+
+Check order 4: customer 2, GB, silver.
+Order 4 total: 17860.446
+Items:
+29: qty10, 47.99. silver, qty10 -> disc 0.12. line = 10*47.99*0.88 = 479.9*0.88 = 422.312. OK.
+30: qty10, 480.99. disc 0.12. 10*480.99*0.88 = 4809.9*0.88 = 4232.712. OK.
+31: qty3, 130.85. disc 0.05. 3*130.85*0.95 = 392.55*0.95 = 372.9225. OK.
+32: qty3, 6.16. disc 0.05. 3*6.16*0.95 = 18.48*0.95 = 17.556. OK.
+33: qty7, 189.97. disc 0.10. 7*189.97*0.9 = 1329.79*0.9 = 1196.811. OK.
+34: qty1, 66.95. disc 0.05. 1*66.95*0.95 = 63.6025. OK.
+35: qty4, 64.67. disc 0.05. 4*64.67*0.95 = 258.68*0.95 = 245.746. OK.
+36: qty3, 6.98. disc 0.05. 3*6.98*0.95 = 20.94*0.95 = 19.893. OK.
+37: qty2, 299.98. disc 0.05. 2*299.98*0.95 = 599.96*0.95 = 569.962. OK.
+38: qty10, 111.95. disc 0.12. 10*111.95*0.88 = 1119.5*0.88 = 985.16. OK.
+39: qty3, 6.2. disc 0.05. 3*6.2*0.95 = 18.6*0.95 = 17.67. OK.
+40: qty3, 14.28. disc 0.05. 3*14.28*0.95 = 42.84*0.95 = 40.698. OK.
+41: qty10, 477.85. disc 0.12. 10*477.85*0.88 = 4778.5*0.88 = 4205.08. OK.
+42: qty1, 253.14. disc 0.05. 1*253.14*0.95 = 240.483. OK.
+43: qty7, 256.63. disc 0.10. 7*256.63*0.9 = 1796.41*0.9 = 1616.769. OK.
+44: qty10, 72.31. disc 0.12. 10*72.31*0.88 = 723.1*0.88 = 636.328. OK.
+Sum line totals: let's add.
+422.312 + 4232.712 = 4655.024
++372.9225 = 5027.9465
++17.556 = 5045.5025
++1196.811 = 6242.3135
++63.6025 = 6305.916
++245.746 = 6551.662
++19.893 = 6571.555
++569.962 = 7141.517
++985.16 = 8126.677
++17.67 = 8144.347
++40.698 = 8185.045
++4205.08 = 12390.125
++240.483 = 12630.608
++1616.769 = 14247.377
++636.328 = 14883.705
+Tax for GB: 0.20. Total = 14883.705 * 1.2 = 17860.446. Matches exactly.
+
+So order 4 is correct.
+
+Given the consistency, derivation is likely correct for all.
+
+Now, what about the status transition? The problem might be designed such that the blank prev_status is a violation. But let's think: the trigger is provided as part of the rule set. The trigger explicitly lists allowed transitions and includes (pending,pending) as initial state. The data has blank prev_status for initial pending. In PostgreSQL, if prev_status is NULL, the trigger would not raise an exception because ARRAY[NULL,'pending'] = ANY(...) yields NULL, and IF NOT NULL is false. So the trigger would allow it. But the natural language description says the pair must lie in the allowed set. However, the natural language description is a summary of the procedural rules. The trigger is the actual procedural rule. The problem says "Status transition: the pair (prev_status, status) of every order lies in the allowed set ...". This is a direct statement. So we must apply it literally.
+
+But maybe the blank in CSV is just a representation of NULL, and the pair (NULL, pending) is not in the set, so it's illegal. That seems plausible.
+
+However, is there any other transition violation? Let's check order 67: prev empty, status pending. Not allowed. Order 69: prev empty, status pending. Not allowed. So many.
+
+If the state is illegal due to transition_break, we should output that.
+
+But before concluding, let's consider if there is any cardinality break we missed. Per-order item count: each order must have between 1 and 20 line items. We counted all orders and they have 1-20. But let's double-check order 54: item 576 only. That's 1 item. OK. Order 65: item 687 only. OK. Order 75: item 811 only. OK. Order 77: item 823 only. OK. Order 80: item 833 only. OK. Order 95: items 1000-1001 (2). OK. Order 101: items 1075-1076 (2). OK. Order 103: items 1090-1091 (2). OK. Order 105: item 1095 (1). OK. Order 120: item 1259 (1). OK. Order 138: items 1470-1473 (4). OK. Order 139: items 1474-1477 (4). OK. Order 149: items 1582-1583 (2). OK.
+
+All seem within 1-20.
+
+Now, is there any customer with >3 open orders? Let's recount carefully.
+
+Customer 3: orders 7(shipped),8(pending),9(shipped). That's 3 open. OK.
+Customer 5: orders 11(pending),12(pending). 2 open. OK.
+Customer 10: orders 23(pending),24(shipped). 2 open. OK.
+Customer 11: orders 28(shipped),29(shipped). 2 open. OK.
+Customer 13: orders 34(shipped),35(pending). 2 open. OK.
+Customer 14: orders 38(shipped),39(shipped). 2 open. OK.
+Customer 15: order 44(pending). 1 open. OK.
+Customer 16: order 46(pending). 1 open. OK.
+Customer 17: orders 49(shipped),50(pending). 2 open. OK.
+Customer 19: order 56(pending). 1 open. OK.
+Customer 21: order 64(shipped). 1 open. OK.
+Customer 23: orders 67(pending),68(shipped). 2 open. OK.
+Customer 24: order 69(pending). 1 open. OK.
+Customer 26: order 78(shipped). 1 open. OK.
+Customer 27: order 83(shipped). 1 open. OK.
+Customer 28: orders 84(shipped),85(pending),86(pending). 3 open. OK.
+Customer 30: orders 91(pending),92(shipped). 2 open. OK.
+Customer 31: orders 95(pending),96(pending),97(pending). 3 open. OK.
+Customer 36: orders 108(pending),109(pending),110(pending). 3 open. OK.
+Customer 38: orders 115(pending),116(shipped). 2 open. OK.
+Customer 39: orders 117(pending),118(shipped),119(pending). 3 open. OK.
+Customer 40: orders 123(shipped),124(pending). 2 open. OK.
+Customer 41: order 126(pending). 1 open. OK.
+Customer 42: orders 130(pending),131(shipped). 2 open. OK.
+Customer 44: orders 134(shipped),135(pending),136(shipped). 3 open. OK.
+Customer 46: order 138(shipped). 1 open. OK.
+Customer 48: orders 144(pending),145(pending). 2 open. OK.
+Customer 49: orders 147(pending),148(shipped),149(pending). 3 open. OK.
+Customer 50: orders 150(pending),151(shipped). 2 open. OK.
+
+No customer exceeds 3.
+
+Thus the only violation is status transition.
+
+But wait, the problem says "Status transition: the pair (prev_status, status) of every order lies in the allowed set ...". If prev_status is empty string '', then the pair is ('', 'pending'). That is not in the set. So it's a transition_break.
+
+However, could empty string be considered NULL, and the pair (NULL, pending) is not in the set? Yes.
+
+But is there any order where prev_status is empty and status is not pending? No.
+
+So the state is ILLEGAL due to transition_break.
+
+But I want to be absolutely sure there isn't a derivation break. Let's check a few more random orders, especially those with many items and different tiers.
+
+Check order 130 (customer 42, US, gold). Order total: 13588.75386.
+Items 1359-1373.
+Let's compute a few:
+1359: qty4, 135.0. gold, qty4 -> disc 0.10. 4*135*0.9 = 486.0. OK.
+1360: qty4, 179.77. gold, disc 0.10. 4*179.77*0.9 = 647.172. OK.
+1361: qty6, 263.28. gold, qty6 -> disc 0.15. 6*263.28*0.85 = 1579.68*0.85 = 1342.728. OK.
+1362: qty4, 16.64. disc 0.10. 4*16.64*0.9 = 59.904. OK.
+1363: qty1, 490.42. disc 0.10. 1*490.42*0.9 = 441.378. OK.
+1364: qty2, 120.54. disc 0.10. 2*120.54*0.9 = 216.972. OK.
+1365: qty5, 104.36. disc 0.15. 5*104.36*0.85 = 521.8*0.85 = 443.53. OK.
+1366: qty1, 383.94. disc 0.10. 345.546. OK.
+1367: qty9, 291.38. disc 0.15. 9*291.38*0.85 = 2622.42*0.85 = 2229.057. OK.
+1368: qty5, 241.41. disc 0.15. 5*241.41*0.85 = 1207.05*0.85 = 1025.9925. OK.
+1369: qty4, 161.46. disc 0.10. 4*161.46*0.9 = 581.256. OK.
+1370: qty8, 314.38. disc 0.15. 8*314.38*0.85 = 2515.04*0.85 = 2137.784. OK.
+1371: qty2, 59.42. disc 0.10. 2*59.42*0.9 = 106.956. OK.
+1372: qty8, 336.44. disc 0.15. 8*336.44*0.85 = 2691.52*0.85 = 2287.792. OK.
+1373: qty4, 63.92. disc 0.10. 4*63.92*0.9 = 230.112. OK.
+Sum: let's add.
+486 + 647.172 = 1133.172
++1342.728 = 2475.9
++59.904 = 2535.804
++441.378 = 2977.182
++216.972 = 3194.154
++443.53 = 3637.684
++345.546 = 3983.23
++2229.057 = 6212.287
++1025.9925 = 7238.2795
++581.256 = 7819.5355
++2137.784 = 9957.3195
++106.956 = 10064.2755
++2287.792 = 12352.0675
++230.112 = 12582.1795
+Tax for US: 0.08. Total = 12582.1795 * 1.08 = 13588.75386. Let's compute: 12582.1795 * 1.08 = 12582.1795 + 1006.57436 = 13588.75386. Exactly matches.
+
+So derivation is correct.
+
+Now, check order 148 (customer 49, US, silver). Total: 23740.85808.
+Items 1562-1581. That's 20 items. Let's compute sum and see.
+But given the pattern, it's likely correct.
+
+Thus the only violation is transition.
+
+But wait, the problem says "the pair (prev_status, status) of every order lies in the allowed set". If prev_status is empty, it's not in the set. So transition_break.
+
+However, I need to consider whether the empty prev_status is actually NULL or empty string. In CSV, it's empty. When loaded into a VARCHAR column, it could be empty string. The trigger uses ARRAY[NEW.prev_status, NEW.status]. If prev_status is empty string '', then ARRAY['', 'pending'] is definitely not equal to ANY of the allowed arrays. Then NOT (FALSE) = TRUE, and the trigger would raise. So if the state were actually inserted through the trigger, it would be illegal. But the state is given as CSV. The question is: does the state satisfy the rules? The rules include the trigger. The trigger would reject empty string prev_status. So it's illegal.
+
+But the natural language rule says the pair must be in the set. Empty string is not in the set. So either way, it's illegal.
+
+Thus the answer is {"label":"ILLEGAL","violation":"transition_break"}.
+
+But before finalizing, let's consider if there is any other subtle violation. For example, order 8 has prev_status empty and total 29526.27167. Could there be a derivation error? We can check quickly.
+
+Order 8: customer 3, DE, bronze.
+Items 86-102 (17 items). Let's compute sum and tax.
+Tax DE = 0.19.
+Items:
+86: qty6, 156.36. bronze, qty6 -> disc 0.05. 6*156.36*0.95 = 891.252. OK.
+87: qty10, 216.49. disc 0.07. 10*216.49*0.93 = 2013.357. OK.
+88: qty6, 313.23. disc 0.05. 6*313.23*0.95 = 1785.411. OK.
+89: qty4, 452.97. disc 0.00. 4*452.97 = 1811.88. OK.
+90: qty4, 278.23. disc 0.00. 1112.92. OK.
+91: qty2, 136.04. disc 0.00. 272.08. OK.
+92: qty2, 482.06. disc 0.00. 964.12. OK.
+93: qty8, 268.21. disc 0.05. 8*268.21*0.95 = 2038.396. OK.
+94: qty2, 462.63. disc 0.00. 925.26. OK.
+95: qty1, 492.35. disc 0.00. 492.35. OK.
+96: qty10, 337.96. disc 0.07. 10*337.96*0.93 = 3143.028. OK.
+97: qty7, 290.51. disc 0.05. 7*290.51*0.95 = 1931.8915. OK.
+98: qty6, 11.5. disc 0.05. 6*11.5*0.95 = 65.55. OK.
+99: qty10, 307.95. disc 0.07. 10*307.95*0.93 = 2863.935. OK.
+100: qty8, 257.21. disc 0.05. 8*257.21*0.95 = 1954.796. OK.
+101: qty4, 211.49. disc 0.00. 845.96. OK.
+102: qty7, 255.61. disc 0.05. 7*255.61*0.95 = 1699.8065. OK.
+Sum: let's add.
+891.252 + 2013.357 = 2904.609
++1785.411 = 4690.02
++1811.88 = 6501.9
++1112.92 = 7614.82
++272.08 = 7886.9
++964.12 = 8851.02
++2038.396 = 10889.416
++925.26 = 11814.676
++492.35 = 12307.026
++3143.028 = 15450.054
++1931.8915 = 17381.9455
++65.55 = 17447.4955
++2863.935 = 20311.4305
++1954.796 = 22266.2265
++845.96 = 23112.1865
++1699.8065 = 24811.993
+Tax 0.19: 24811.993 * 1.19 = 24811.993 + 4714.27867 = 29526.27167. Exactly matches.
+
+So derivation is correct.
+
+Given all this, the state is illegal only because of the blank prev_status.
+
+But wait, the problem says "Status transition: the pair (prev_status, status) of every order lies in the allowed set ...". Could the blank be interpreted as 'pending'? In the CSV, some rows have explicit "pending" for prev_status (e.g., order 3). So blank is not "pending". It's a distinct value. Thus it's a violation.
+
+However, I recall that in some CSV representations, NULL is written as empty string. The trigger function uses ARRAY[NEW.prev_status, NEW.status] = ANY(allowed). If prev_status is NULL, the expression is NULL, and the IF NOT (NULL) is false, so the trigger does NOT raise. That means the trigger actually allows NULL prev_status with pending status. But the natural language rule says the pair must be in the allowed set. The natural language rule is a description of the procedural rule. The procedural rule is the trigger. The trigger allows NULL. So which one governs?
+
+The problem statement says: "The following rules are not in the DDL. They live in application code and constrain legal database states: ... Status transition ...". Then it gives the allowed set. It also gives the trigger code. The trigger code is the procedural component. The natural language description is also given. The classification instructions list the four checks, and the status transition check is defined as the pair lying in the allowed set. It does not say "as enforced by the trigger". It says the pair must lie in that set. So we should use the set.
+
+But if the trigger allows NULL, why would the natural language rule not mention it? Because the natural language rule is an approximation, and the trigger is the exact rule. However, the problem explicitly says "A state is LEGAL iff every one of the following holds." and then lists the four checks. The fourth check is exactly the natural language rule. So we must apply that.
+
+Thus the state is ILLEGAL, violation transition_break.
+
+But let's double-check if there is any order where prev_status is not empty, not pending, not shipped. Looking at orders, prev_status values are: empty, pending, shipped. No other values. So the only bad pairs are empty/pending.
+
+Now, is there any order with status 'delivered' and prev_status 'pending'? No. All delivered have prev_status 'shipped'. All cancelled have prev_status 'pending'. All shipped have prev_status 'pending'. All pending have prev_status empty or pending? Wait, some pending have prev_status 'pending'? Let's check: order 119: prev empty, status pending. Order 124: prev empty, status pending. Are there any pending with prev_status 'pending'? No. The only pending orders are initial (prev empty) or maybe some other? Let's check order 39: status shipped, prev pending. Order 117: status pending, prev empty. So pending status only appears with empty prev_status. That means there are no orders that transitioned to pending from pending. The allowed set includes (pending,pending) but that is not used except maybe if prev_status were pending. In the data, it's empty.
+
+This suggests that the data generator used NULL/empty for initial state, while the rule expects 'pending'. This is a classic mismatch.
+
+Given the explicit instruction, I will classify as ILLEGAL with transition_break.
+
+But I want to be 100% sure there is no other violation. Let's check if any order has >20 items. I counted order 15: 20 items. Order 44: 20 items. Order 131: 20 items. Order 148: 20 items. None exceed 20. So cardinality_break is not present.
+
+Check FK: all order_items.order_id <=151 and >=1. Orders exist for all? Yes, orders 1..151. But wait, are there any order_ids in items that don't exist in orders? Orders go from 1 to 151, but are all present? Let's check: orders list includes 1..151. Yes, all present. Customers 1..50 all present. So FK is fine.
+
+Thus the answer is transition_break.
+
+One more thought: the problem says "Reply with a single JSON object on one line, no prose". So I must output exactly:
+
+{"label":"ILLEGAL","violation":"transition_break"}
+
+I should not include any extra spaces? The example shows spaces after colon. But "no prose" means just the JSON. I'll output compact or with spaces? The example: {"label": "LEGAL"} and {"label": "ILLEGAL", "violation": "X"}. So I'll follow that format.
+
+Final answer: {"label": "ILLEGAL", "violation": "transition_break"}

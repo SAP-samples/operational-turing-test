@@ -1,0 +1,59 @@
+We need to classify the database state as LEGAL or ILLEGAL based on four checks: referential integrity, cardinality, derivation, and status transition. We need to find if any violation exists. If multiple, we can report any one? The spec says "X is one of fk_break, cardinality_break, derivation_break, transition_break". So we can report the first we find, but we need to be accurate.
+
+Given the size of the data (150 orders, 1595 order_items, 50 customers), doing this manually is error-prone. But we can reason about which checks are likely to fail. Let's parse the data carefully.
+
+First, referential integrity:
+- orders.customer_id must be in customers.id.
+- order_items.order_id must be in orders.id.
+
+Looking at orders.csv, there are customer_ids like 1013, 410, 271, 489, 846, 808, 313. These are not in customers.csv (customers 1-50). So there are FK violations: orders with customer_id not in customers. For example, order 42 has customer_id 1013. Order 50 has customer_id 410. Order 61 has 271. Order 64 has 489. Order 71 has 846. Order 116 has 808. Order 131 has 313.
+
+Thus referential integrity is broken. So the state is ILLEGAL with violation fk_break.
+
+But wait: we must also check order_items.order_id references orders.id. That might also be broken, but FK break already covers it.
+
+However, we need to be careful: the problem says "Referential integrity: every orders.customer_id occurs in customers.id; every order_items.order_id occurs in orders.id." Since there are orders.customer_id values not in customers, it's fk_break.
+
+But let's double-check if there are any order_items.order_id not in orders.id. The orders go from 1 to 150 (but some missing? Let's see). Actually orders.csv has ids 1 to 150? Let's check: the last row is 150. Are all order_ids in order_items within 1..150? The order_items.csv has order_id up to 150? Let's see the last few: order_id 150 appears. But there might be order_ids in items that are not in orders. For example, order_id 151? No, max seems 150. But we need to check if every order_id in items exists in orders. Since orders has 150 rows (maybe some missing? Let's count). Actually orders.csv has rows 1 to 150, but some might be missing? Let's check: row 42 is customer_id 1013, row 50 is 410, row 61 is 271, row 64 is 489, row 71 is 846, row 116 is 808, row 131 is 313. So orders 1-150 all present? It seems yes, 150 rows. So order_items likely reference existing orders. But the customer_id FK is definitely broken.
+
+Thus the answer is {"label": "ILLEGAL", "violation": "fk_break"}.
+
+But wait, we should verify that there isn't some subtlety: maybe the CSV includes rows with empty prev_status? The trigger allows (pending, pending) but prev_status is empty string? Let's check orders with empty prev_status: e.g., order 4 has prev_status empty. The trigger checks ARRAY[NEW.prev_status, NEW.status] = ANY(allowed). If prev_status is NULL or empty string, does it match? The allowed array includes ['pending', 'pending'] but not ['', 'pending'] or [NULL, 'pending']. However, the trigger is defined as BEFORE INSERT OR UPDATE. But the state is given as a static snapshot. The rule says "Status transition: the pair (prev_status, status) of every order lies in the allowed set". So we need to check that too. But if prev_status is empty string, that might be a transition_break. However, the presence of FK break means we can already label it ILLEGAL with fk_break. The question says "A single violation makes the state ILLEGAL". So we can just report fk_break.
+
+But let's be thorough: Are there any orders with prev_status empty? Yes, many: orders 4,5,7,8,13,14,19,20,29,43,47,58,60,72,77,95,102,103,104,110,111,114,115,119,130. The allowed set requires prev_status to be 'pending' for those statuses (pending, shipped, delivered, cancelled). Actually the allowed transitions are:
+- pending -> shipped
+- shipped -> delivered
+- pending -> cancelled
+- pending -> pending
+
+So if prev_status is empty, that is not allowed. But maybe empty string is considered NULL? In the CSV, it's blank. In PostgreSQL, a blank string is not NULL; it's ''. The trigger would compare ARRAY['', 'pending'] which is not in allowed. So those rows would violate the transition rule. But again, FK break is enough.
+
+However, we need to ensure that the FK break is indeed a violation of "every orders.customer_id occurs in customers.id". The customers table has ids 1-50. Orders have customer_ids like 1013, 410, etc. So definitely not.
+
+Thus answer: {"label":"ILLEGAL","violation":"fk_break"}.
+
+But wait, the problem might be designed such that there are multiple violations and any is acceptable. But we must be sure that the FK break is real and not a misread. Let's list the invalid customer_ids in orders:
+
+Order 42: customer_id 1013
+Order 50: customer_id 410
+Order 61: customer_id 271
+Order 64: customer_id 489
+Order 71: customer_id 846
+Order 116: customer_id 808
+Order 131: customer_id 313
+
+None of these are in customers.csv (1-50). So yes.
+
+Thus final answer is the JSON.
+
+But before finalizing, let's consider if there is any trick: maybe the CSV has a header and the data is fine? No, the data clearly shows those numbers.
+
+Also check order_items.order_id: Are there any order_ids in items that don't exist in orders? The orders table has 150 rows, ids 1-150. The items have order_id up to 150. But are there any order_ids missing in orders? Let's check if orders.csv has all ids 1-150. It seems yes: the first column goes 1,2,3,... up to 150. So all order_ids in items are valid. But the customer_id FK is broken.
+
+Therefore, the classification is ILLEGAL due to fk_break.
+
+One more check: The problem says "Reply with a single JSON object on one line, no prose". So we must output exactly that.
+
+Thus: {"label": "ILLEGAL", "violation": "fk_break"}.
+
+I will produce that.

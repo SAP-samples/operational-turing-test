@@ -1,0 +1,570 @@
+We need to classify the state as LEGAL or ILLEGAL based on four checks: referential integrity, cardinality, derivation, and status transition. We need to parse the CSV data, compute the necessary values, and check for violations.
+
+First, let's understand the data.
+
+Customers: 50 customers, id 1 to 50.
+Orders: 156 orders, id 1 to 156.
+Order_items: 1686 items, id 1 to 1686.
+
+We need to check:
+
+1. Referential integrity:
+   - Every orders.customer_id in customers.id.
+   - Every order_items.order_id in orders.id.
+
+2. Cardinality:
+   - Each order has 1-20 line items.
+   - Each customer has at most 3 open orders (status in {pending, shipped}).
+
+3. Derivation:
+   - line_total = quantity * unit_price * (1 - discount(tier, quantity))
+   - order.total = sum(line_total for items in this order) * (1 + tax(country))
+   - discount table:
+     - bronze: [1,4] 0.00, [5,9] 0.05, [10,19] 0.07
+     - silver: [1,4] 0.05, [5,9] 0.10, [10,19] 0.12
+     - gold: [1,4] 0.10, [5,9] 0.15, [10,19] 0.20
+     - quantity 20 is not in any discount band? Wait: "quantity is always in [1, 20]; the maximum bucket is closed at 19, and quantity = 20 is a per-order cardinality bound, not a discount band." This implies that discount for quantity 20 is not defined in the table. But the rule says line_total = quantity * unit_price * (1 - discount(tier, quantity)). If quantity=20, what is discount? The table only covers up to 19. The text says "quantity is always in [1, 20]; the maximum bucket is closed at 19, and quantity = 20 is a per-order cardinality bound, not a discount band." This is ambiguous. It might mean that quantity 20 gets no discount? Or that the discount function is only defined for 1-19, and quantity 20 is invalid for line items? Wait, the per-order item count is 1-20 line items inclusive. The quantity column is per line item. The CHECK says quantity > 0. There's no upper bound on quantity per line item in DDL, but the procedural rule says "quantity is always in [1, 20]". Actually, reading carefully: "(quantity is always in [1, 20]; the maximum bucket is closed at 19, and quantity = 20 is a per-order cardinality bound, not a discount band.)" This seems to say that the quantity on a line item is always between 1 and 20. The discount table has bands [1,4], [5,9], [10,19]. What about quantity=20? It says "quantity = 20 is a per-order cardinality bound, not a discount band." This could mean that if quantity=20, there is no discount (i.e., discount=0) because it's not in any band. Or it could mean that the discount for [10,19] applies? No, it explicitly says "not a discount band". So likely discount(20) = 0? Or maybe the rule implies that quantity never equals 20 in legal states? But the per-order item count is about number of line items per order, not quantity per line item. The note says "quantity is always in [1, 20]". So quantity can be 20. But discount table doesn't cover it. In many such problems, the discount for qty 20 might be 0, or maybe it's an error. Let's examine the data to see if any quantity=20 appears.
+
+Looking through order_items.csv, I see quantities like 10, 8, etc. Let me scan for 20. I see id 25: quantity 10. id 38: quantity 10. id 53: quantity 10. id 70: quantity 10. id 82: quantity 10. id 93: quantity 10. id 104: quantity 10. id 111: quantity 8. id 125: quantity 10. id 136: quantity 6. id 153: quantity 10. id 177: quantity 10. id 208: quantity 10. id 223: quantity 10. id 236: quantity 10. id 247: quantity 10. id 248: quantity 10. id 249: quantity 10. id 273: quantity 10. id 280: quantity 8. id 288: quantity 10. id 293: quantity 9. id 300: quantity 8. id 306: quantity 9. id 310: quantity 10. id 323: quantity 10. id 324: quantity 8. id 344: quantity 10. id 356: quantity 10. id 357: quantity 5. id 364: quantity 7. id 370: quantity 7. id 376: quantity 6. id 379: quantity 8. id 389: quantity 10. id 393: quantity 10. id 396: quantity 10. id 400: quantity 1. id 416: quantity 10. id 419: quantity 10. id 425: quantity 10. id 434: quantity 10. id 441: quantity 10. id 452: quantity 10. id 453: quantity 10. id 458: quantity 9. id 461: quantity 9. id 477: quantity 10. id 481: quantity 10. id 482: quantity 10. id 489: quantity 10. id 496: quantity 10. id 500: quantity 9. id 501: quantity 10. id 506: quantity 9. id 508: quantity 10. id 518: quantity 10. id 528: quantity 10. id 529: quantity 10. id 535: quantity 10. id 548: quantity 9. id 564: quantity 10. id 568: quantity 10. id 573: quantity 9. id 576: quantity 9. id 581: quantity 10. id 590: quantity 10. id 596: quantity 10. id 597: quantity 8. id 607: quantity 8. id 609: quantity 8. id 610: quantity 8. id 620: quantity 9. id 621: quantity 7. id 625: quantity 5. id 628: quantity 2. id 629: quantity 3. id 630: quantity 4. id 631: quantity 7. id 632: quantity 9. id 641: quantity 9. id 646: quantity 9. id 660: quantity 10. id 671: quantity 10. id 680: quantity 10. id 684: quantity 9. id 685: quantity 8. id 687: quantity 8. id 700: quantity 9. id 701: quantity 9. id 702: quantity 8. id 703: quantity 8. id 704: quantity 8. id 713: quantity 10. id 720: quantity 10. id 732: quantity 8. id 736: quantity 8. id 743: quantity 8. id 750: quantity 9. id 751: quantity 8. id 756: quantity 10. id 760: quantity 10. id 768: quantity 7. id 770: quantity 8. id 771: quantity 8. id 780: quantity 8. id 781: quantity 9. id 785: quantity 10. id 788: quantity 9. id 792: quantity 10. id 793: quantity 10. id 797: quantity 10. id 798: quantity 9. id 802: quantity 9. id 806: quantity 9. id 810: quantity 10. id 812: quantity 10. id 817: quantity 9. id 822: quantity 8. id 824: quantity 9. id 832: quantity 10. id 838: quantity 10. id 842: quantity 10. id 847: quantity 6. id 850: quantity 7. id 851: quantity 8. id 864: quantity 10. id 865: quantity 10. id 874: quantity 10. id 878: quantity 8. id 880: quantity 10. id 881: quantity 9. id 889: quantity 9. id 890: quantity 6. id 891: quantity 8. id 904: quantity 9. id 905: quantity 6. id 908: quantity 4. id 914: quantity 8. id 917: quantity 8. id 918: quantity 6. id 923: quantity 10. id 931: quantity 10. id 935: quantity 8. id 939: quantity 10. id 940: quantity 5. id 941: quantity 3. id 942: quantity 5. id 947: quantity 10. id 955: quantity 10. id 962: quantity 10. id 963: quantity 10. id 965: quantity 10. id 970: quantity 10. id 971: quantity 8. id 978: quantity 9. id 979: quantity 6. id 984: quantity 10. id 987: quantity 6. id 991: quantity 10. id 993: quantity 8. id 997: quantity 8. id 999: quantity 10. id 1000: quantity 10. id 1003: quantity 6. id 1008: quantity 6. id 1009: quantity 8. id 1010: quantity 9. id 1011: quantity 9. id 1012: quantity 7. id 1024: quantity 10. id 1025: quantity 10. id 1034: quantity 6. id 1035: quantity 10. id 1037: quantity 10. id 1041: quantity 9. id 1047: quantity 10. id 1048: quantity 9. id 1054: quantity 10. id 1056: quantity 10. id 1057: quantity 9. id 1062: quantity 10. id 1068: quantity 10. id 1072: quantity 7. id 1076: quantity 9. id 1077: quantity 8. id 1079: quantity 7. id 1080: quantity 4. id 1083: quantity 8. id 1088: quantity 10. id 1090: quantity 8. id 1096: quantity 5. id 1100: quantity 8. id 1101: quantity 7. id 1102: quantity 8. id 1110: quantity 10. id 1114: quantity 7. id 1124: quantity 10. id 1126: quantity 10. id 1127: quantity 9. id 1135: quantity 9. id 1143: quantity 9. id 1147: quantity 9. id 1150: quantity 10. id 1153: quantity 10. id 1154: quantity 10. id 1156: quantity 8. id 1157: quantity 8. id 1161: quantity 9. id 1162: quantity 9. id 1168: quantity 8. id 1177: quantity 8. id 1180: quantity 8. id 1182: quantity 5. id 1184: quantity 8. id 1189: quantity 7. id 1192: quantity 9. id 1193: quantity 3. id 1194: quantity 7. id 1195: quantity 8. id 1198: quantity 9. id 1199: quantity 8. id 1200: quantity 10. id 1201: quantity 7. id 1203: quantity 10. id 1204: quantity 8. id 1205: quantity 2. id 1206: quantity 8. id 1210: quantity 9. id 1215: quantity 9. id 1216: quantity 4. id 1218: quantity 8. id 1223: quantity 9. id 1224: quantity 10. id 1225: quantity 8. id 1226: quantity 6. id 1236: quantity 9. id 1237: quantity 2. id 1238: quantity 6. id 1243: quantity 8. id 1245: quantity 5. id 1247: quantity 9. id 1249: quantity 9. id 1251: quantity 10. id 1252: quantity 4. id 1256: quantity 8. id 1260: quantity 8. id 1264: quantity 8. id 1265: quantity 8. id 1266: quantity 10. id 1267: quantity 8. id 1269: quantity 1. id 1270: quantity 10. id 1271: quantity 7. id 1276: quantity 10. id 1277: quantity 9. id 1278: quantity 8. id 1279: quantity 7. id 1280: quantity 10. id 1282: quantity 6. id 1283: quantity 6. id 1284: quantity 6. id 1287: quantity 7. id 1288: quantity 2. id 1290: quantity 4. id 1291: quantity 5. id 1292: quantity 5. id 1293: quantity 9. id 1294: quantity 6. id 1299: quantity 10. id 1300: quantity 3. id 1303: quantity 8. id 1304: quantity 6. id 1305: quantity 1. id 1306: quantity 5. id 1307: quantity 3. id 1308: quantity 6. id 1309: quantity 6. id 1310: quantity 10. id 1311: quantity 5. id 1313: quantity 9. id 1314: quantity 7. id 1319: quantity 10. id 1320: quantity 1. id 1325: quantity 8. id 1328: quantity 9. id 1332: quantity 8. id 1334: quantity 2. id 1335: quantity 7. id 1338: quantity 6. id 1340: quantity 10. id 1343: quantity 1. id 1344: quantity 10. id 1346: quantity 6. id 1347: quantity 9. id 1348: quantity 5. id 1349: quantity 9. id 1350: quantity 4. id 1351: quantity 6. id 1353: quantity 5. id 1356: quantity 9. id 1357: quantity 7. id 1362: quantity 8. id 1364: quantity 6. id 1365: quantity 4. id 1366: quantity 4. id 1368: quantity 6. id 1371: quantity 9. id 1373: quantity 8. id 1375: quantity 9. id 1376: quantity 7. id 1377: quantity 6. id 1378: quantity 5. id 1380: quantity 8. id 1383: quantity 7. id 1384: quantity 8. id 1385: quantity 8. id 1386: quantity 10. id 1394: quantity 4. id 1396: quantity 4. id 1397: quantity 3. id 1398: quantity 1. id 1400: quantity 10. id 1402: quantity 9. id 1404: quantity 10. id 1407: quantity 10. id 1408: quantity 8. id 1409: quantity 8. id 1413: quantity 10. id 1415: quantity 10. id 1416: quantity 9. id 1422: quantity 9. id 1427: quantity 10. id 1428: quantity 7. id 1431: quantity 9. id 1434: quantity 9. id 1440: quantity 7. id 1447: quantity 9. id 1450: quantity 9. id 1455: quantity 9. id 1458: quantity 10. id 1464: quantity 10. id 1470: quantity 10. id 1479: quantity 10. id 1480: quantity 9. id 1481: quantity 8. id 1484: quantity 7. id 1486: quantity 8. id 1488: quantity 1. id 1490: quantity 9. id 1493: quantity 8. id 1496: quantity 10. id 1498: quantity 8. id 1500: quantity 10. id 1502: quantity 10. id 1506: quantity 10. id 1510: quantity 1. id 1513: quantity 9. id 1515: quantity 6. id 1516: quantity 7. id 1519: quantity 10. id 1520: quantity 6. id 1521: quantity 7. id 1524: quantity 6. id 1526: quantity 8. id 1530: quantity 9. id 1533: quantity 8. id 1540: quantity 10. id 1548: quantity 10. id 1551: quantity 9. id 1555: quantity 5. id 1557: quantity 4. id 1558: quantity 4. id 1561: quantity 8. id 1564: quantity 3. id 1565: quantity 6. id 1567: quantity 7. id 1568: quantity 9. id 1569: quantity 6. id 1570: quantity 9. id 1576: quantity 10. id 1577: quantity 9. id 1578: quantity 10. id 1582: quantity 9. id 1584: quantity 10. id 1585: quantity 9. id 1586: quantity 9. id 1587: quantity 9. id 1589: quantity 9. id 1593: quantity 10. id 1596: quantity 10. id 1597: quantity 10. id 1605: quantity 1. id 1607: quantity 5. id 1608: quantity 7. id 1609: quantity 7. id 1610: quantity 7. id 1611: quantity 9. id 1612: quantity 5. id 1613: quantity 8. id 1615: quantity 10. id 1616: quantity 3. id 1617: quantity 8. id 1618: quantity 7. id 1620: quantity 10. id 1622: quantity 1. id 1627: quantity 9. id 1633: quantity 9. id 1636: quantity 10. id 1637: quantity 10. id 1646: quantity 8. id 1648: quantity 10. id 1655: quantity 9. id 1660: quantity 10. id 1662: quantity 8. id 1668: quantity 9. id 1674: quantity 10. id 1684: quantity 10.
+
+I don't see any quantity = 20. The maximum I see is 10. So we don't have to worry about quantity 20 discount ambiguity. Good.
+
+Tax table:
+country DE: 0.19
+FR: 0.20
+GB: 0.20
+JP: 0.10
+US: 0.08
+anything else: 0.15
+
+Discount function:
+bronze: qty 1-4: 0.00, 5-9: 0.05, 10-19: 0.07
+silver: qty 1-4: 0.05, 5-9: 0.10, 10-19: 0.12
+gold: qty 1-4: 0.10, 5-9: 0.15, 10-19: 0.20
+
+So for each line item, we need to compute expected line_total = quantity * unit_price * (1 - discount). Then sum per order, multiply by (1 + tax) to get expected order total. Compare to orders.total.
+
+But note: the orders.total values have many decimal places. We need to be careful with floating point precision. The values are given with up to 5 decimal places. We should compute with high precision and see if they match. However, doing this manually for 156 orders and 1686 line items is impractical in a text response without a program. But we can look for obvious discrepancies or check specific suspicious ones. Alternatively, maybe there's a simpler violation.
+
+Let's first check referential integrity and cardinality, which are easier.
+
+Referential integrity:
+- orders.customer_id: 1 to 50. All customers exist? customers.csv has ids 1-50. So yes.
+- order_items.order_id: 1 to 156. orders.csv has ids 1-156. So yes.
+
+Cardinality:
+- Each order has 1-20 line items. Let's count items per order. We can scan the order_items.csv. The order_id column goes from 1 to 156. Let's see if any order has 0 items or >20 items. Since there are 1686 items for 156 orders, average is about 10.8. We need to check if any order has >20. Let's see the distribution. We can try to count quickly by looking at the order_id transitions.
+
+But maybe there's a cardinality break in per-customer open orders. Let's count open orders per customer.
+
+Open order = status in {pending, shipped}.
+
+Let's list orders by customer and status.
+
+I'll go through orders.csv and tally open orders per customer.
+
+Customer 1: order 1 (shipped). Open: 1.
+Customer 2: order 2 (shipped), 3 (pending). Open: 2.
+Customer 3: order 4 (delivered), 5 (delivered), 6 (delivered), 7 (cancelled). Open: 0.
+Customer 4: order 8 (cancelled), 9 (delivered), 10 (delivered). Open: 0.
+Customer 5: order 11 (delivered), 12 (cancelled), 13 (shipped). Open: 1.
+Customer 6: order 14 (delivered), 15 (delivered), 16 (delivered), 17 (cancelled), 18 (shipped). Open: 1.
+Customer 7: order 19 (delivered), 20 (delivered). Open: 0.
+Customer 8: order 21 (delivered), 22 (delivered), 23 (delivered), 24 (shipped). Open: 1.
+Customer 9: order 25 (delivered), 26 (cancelled), 27 (shipped), 28 (shipped). Open: 2.
+Customer 10: order 29 (shipped), 30 (pending), 31 (shipped). Open: 3.
+Customer 11: order 32 (delivered), 33 (pending), 34 (shipped), 35 (shipped). Open: 3.
+Customer 12: order 36 (shipped), 37 (pending). Open: 2.
+Customer 13: order 38 (delivered), 39 (cancelled), 40 (shipped). Open: 1.
+Customer 14: order 41 (delivered). Open: 0.
+Customer 15: order 42 (delivered), 43 (cancelled). Open: 0.
+Customer 16: order 44 (cancelled), 45 (pending), 46 (shipped). Open: 2.
+Customer 17: order 47 (delivered), 48 (cancelled), 49 (delivered), 50 (delivered). Open: 0.
+Customer 18: order 51 (delivered), 52 (delivered), 53 (cancelled), 54 (cancelled), 55 (delivered). Open: 0.
+Customer 19: order 56 (delivered), 57 (cancelled), 58 (cancelled). Open: 0.
+Customer 20: order 59 (delivered), 60 (cancelled), 61 (cancelled), 62 (pending), 63 (shipped). Open: 2.
+Customer 21: order 64 (cancelled), 65 (delivered), 66 (shipped). Open: 1.
+Customer 22: order 67 (delivered), 68 (cancelled), 69 (delivered), 70 (delivered). Open: 0.
+Customer 23: order 71 (shipped). Open: 1.
+Customer 24: order 72 (cancelled), 73 (pending), 74 (pending), 75 (shipped). Open: 3.
+Customer 25: order 76 (delivered), 77 (cancelled), 78 (shipped), 79 (shipped), 80 (shipped). Open: 3.
+Customer 26: order 81 (cancelled), 82 (cancelled), 83 (delivered), 84 (cancelled), 85 (cancelled). Open: 0.
+Customer 27: order 86 (delivered), 87 (delivered), 88 (pending). Open: 1.
+Customer 28: order 89 (cancelled), 90 (cancelled). Open: 0.
+Customer 29: order 91 (delivered), 92 (delivered), 93 (pending), 94 (pending). Open: 2.
+Customer 30: order 95 (delivered), 96 (cancelled). Open: 0.
+Customer 31: order 97 (delivered), 98 (delivered), 99 (delivered), 100 (pending), 101 (shipped). Open: 2.
+Customer 32: order 102 (delivered), 103 (cancelled), 104 (delivered). Open: 0.
+Customer 33: order 105 (delivered), 106 (delivered). Open: 0.
+Customer 34: order 107 (delivered), 108 (delivered), 109 (delivered). Open: 0.
+Customer 35: order 110 (cancelled), 111 (delivered), 112 (delivered), 113 (delivered). Open: 0.
+Customer 36: order 114 (cancelled), 115 (delivered), 116 (delivered), 117 (shipped), 118 (pending). Open: 2.
+Customer 37: order 119 (delivered), 120 (delivered), 121 (delivered), 122 (shipped), 123 (shipped). Open: 2.
+Customer 38: order 124 (delivered), 125 (delivered), 126 (cancelled), 127 (delivered), 128 (pending). Open: 1.
+Customer 39: order 129 (cancelled), 130 (delivered), 131 (shipped). Open: 1.
+Customer 40: order 132 (cancelled), 133 (cancelled), 134 (cancelled), 135 (delivered), 136 (pending). Open: 1.
+Customer 41: order 137 (shipped). Open: 1.
+Customer 42: order 138 (delivered). Open: 0.
+Customer 43: order 139 (cancelled), 140 (shipped), 141 (pending). Open: 2.
+Customer 44: order 142 (delivered). Open: 0.
+Customer 45: order 143 (shipped), 144 (shipped). Open: 2.
+Customer 46: order 145 (pending). Open: 1.
+Customer 47: order 146 (delivered), 147 (cancelled), 148 (pending), 149 (shipped), 150 (pending). Open: 3.
+Customer 48: order 151 (delivered). Open: 0.
+Customer 49: order 152 (cancelled), 153 (pending). Open: 1.
+Customer 50: order 154 (shipped), 155 (shipped), 156 (shipped). Open: 3.
+
+Now check if any customer has >3 open orders.
+- Customer 10: 3 (OK)
+- Customer 11: 3 (OK)
+- Customer 24: 3 (OK)
+- Customer 25: 3 (OK)
+- Customer 47: 3 (OK)
+- Customer 50: 3 (OK)
+
+All others have <=3. So per-customer open-order limit is satisfied.
+
+Now check per-order item count: each order must have 1-20 line items. Let's see if any order has >20 items or 0 items. Since there are many items, likely each order has at least 1. But we need to check if any order has >20. Let's count items per order roughly. The order_items list is sorted by order_id? Let's check: id 1-5 are order 1. id 6-14 are order 2. id 15-32 are order 3 (18 items). id 33-49 are order 4 (17 items). id 50-66 are order 5 (17 items). id 67-81 are order 6 (15 items). id 82-92 are order 7 (11 items). id 93-96 are order 8 (4 items). id 97-110 are order 9 (14 items). id 111-117 are order 10 (7 items). id 118-120 are order 11 (3 items). id 121-128 are order 12 (8 items). id 129-131 are order 13 (3 items). id 132-146 are order 14 (15 items). id 147-156 are order 15 (10 items). id 157-169 are order 16 (13 items). id 170-176 are order 17 (7 items). id 177-184 are order 18 (8 items). id 185-192 are order 19 (8 items). id 193-194 are order 20 (2 items). id 195-205 are order 21 (11 items). id 206-219 are order 22 (14 items). id 220-231 are order 23 (12 items). id 232-244 are order 24 (13 items). id 245-253 are order 25 (9 items). id 254-261 are order 26 (8 items). id 262-265 are order 27 (4 items). id 266-269 are order 28 (4 items). id 270-286 are order 29 (17 items). id 287-292 are order 30 (6 items). id 293-295 are order 31 (3 items). id 296-308 are order 32 (13 items). id 309-314 are order 33 (6 items). id 315-334 are order 34 (20 items). Wait, order 34 has 20 items? Let's count: id 315 to 334 inclusive is 20 items. That's allowed (1-20 inclusive). id 335-339 are order 35 (5 items). id 340-345 are order 36 (6 items). id 346-356 are order 37 (11 items). id 357-358 are order 38 (2 items). id 359-376 are order 39 (18 items). id 377-381 are order 40 (5 items). id 382-400 are order 41 (19 items). id 401 are order 42 (1 item). id 402-415 are order 43 (14 items). id 416-426 are order 44 (11 items). id 427-428 are order 45 (2 items). id 429-438 are order 46 (10 items). id 439-443 are order 47 (5 items). id 444-462 are order 48 (19 items). id 463-465 are order 49 (3 items). id 466-474 are order 50 (9 items). id 475-483 are order 51 (9 items). id 484-490 are order 52 (7 items). id 491-497 are order 53 (7 items). id 498-517 are order 54 (20 items). id 518-535 are order 55 (18 items). id 536-541 are order 56 (6 items). id 542-557 are order 57 (16 items). id 558-562 are order 58 (5 items). id 563-576 are order 59 (14 items). id 577-586 are order 60 (10 items). id 587-598 are order 61 (12 items). id 599-630 are order 62 (32 items!). Wait, id 599 to 630 inclusive: 630-599+1 = 32. That's >20! So order 62 has 32 line items. That violates the per-order item count (max 20). Let's verify.
+
+Order 62 in orders.csv:
+62,20,pending,,2022-11-11,17642.068925
+
+Order_items for order 62: id 599 to 630. Let's count:
+599,62,39,8,69.3,498.96
+600,62,29,2,318.87,605.853
+601,62,40,1,486.03,461.7285
+602,62,13,4,205.72,781.736
+603,62,14,5,313.74,1411.83
+604,62,22,5,62.02,279.09
+605,62,23,2,489.63,930.297
+606,62,11,2,450.66,856.254
+607,62,43,8,462.36,3328.992
+608,62,16,2,306.65,582.635
+609,62,5,8,477.09,3435.048
+610,62,30,8,82.94,597.168
+611,62,13,4,413.51,1571.338
+612,63,29,6,133.59,721.386
+613,63,9,1,331.51,314.9345
+614,63,33,4,279.66,1062.708
+615,63,37,6,246.95,1333.53
+616,63,43,3,30.12,85.842
+617,63,9,5,394.05,1773.225
+618,63,50,3,444.88,1267.908
+619,63,5,9,431.83,3497.823
+620,63,15,9,350.12,2835.972
+621,63,35,7,295.33,1860.579
+622,63,21,1,160.78,152.741
+623,63,1,1,475.65,451.8675
+624,63,18,4,393.75,1496.25
+625,63,39,5,109.34,492.03
+626,63,9,7,79.44,500.472
+627,63,3,6,133.73,722.142
+628,63,28,2,365.55,694.545
+629,63,28,3,218.26,622.041
+630,63,40,4,211.53,803.814
+
+Wait, id 612 onwards: order_id is 63, not 62. Let's re-examine. The CSV shows:
+...
+598,61,42,8,66.44,478.368
+599,62,39,8,69.3,498.96
+600,62,29,2,318.87,605.853
+601,62,40,1,486.03,461.7285
+602,62,13,4,205.72,781.736
+603,62,14,5,313.74,1411.83
+604,62,22,5,62.02,279.09
+605,62,23,2,489.63,930.297
+606,62,11,2,450.66,856.254
+607,62,43,8,462.36,3328.992
+608,62,16,2,306.65,582.635
+609,62,5,8,477.09,3435.048
+610,62,30,8,82.94,597.168
+611,62,13,4,413.51,1571.338
+612,63,29,6,133.59,721.386
+...
+
+So order 62 items are id 599 to 611 inclusive. That's 611-599+1 = 13 items. Not 32. I misread. Let's recount carefully.
+
+Actually, id 599 to 611: 611-599+1 = 13. Yes. So order 62 has 13 items.
+
+Let's continue counting to see if any order has >20.
+
+Order 63: id 612 to 630 inclusive? 630-612+1 = 19 items. Let's check: 612 order 63, ... 630 order 63. Yes, 19 items. OK.
+
+Order 64: id 631-637: 7 items.
+Order 65: id 638-653: 16 items.
+Order 66: id 654-670: 17 items.
+Order 67: id 671-690: 20 items. (690-671+1 = 20). OK.
+Order 68: id 691-705: 15 items.
+Order 69: id 706-716: 11 items.
+Order 70: id 717-730: 14 items.
+Order 71: id 731-746: 16 items.
+Order 72: id 747-751: 5 items.
+Order 73: id 752-754: 3 items.
+Order 74: id 755-760: 6 items.
+Order 75: id 761-780: 20 items. (780-761+1 = 20). OK.
+Order 76: id 781-787: 7 items.
+Order 77: id 788-797: 10 items.
+Order 78: id 798-811: 14 items.
+Order 79: id 812-823: 12 items.
+Order 80: id 824-834: 11 items.
+Order 81: id 835-851: 17 items.
+Order 82: id 852-853: 2 items.
+Order 83: id 854-857: 4 items.
+Order 84: id 858-873: 16 items.
+Order 85: id 874-879: 6 items.
+Order 86: id 880-885: 6 items.
+Order 87: id 886-890: 5 items.
+Order 88: id 891-907: 17 items.
+Order 89: id 908-924: 17 items.
+Order 90: id 925-944: 20 items. (944-925+1 = 20). OK.
+Order 91: id 945-961: 17 items.
+Order 92: id 962-981: 20 items. (981-962+1 = 20). OK.
+Order 93: id 982-986: 5 items.
+Order 94: id 987-1002: 16 items.
+Order 95: id 1003: 1 item.
+Order 96: id 1004-1013: 10 items.
+Order 97: id 1014-1028: 15 items.
+Order 98: id 1029-1030: 2 items.
+Order 99: id 1031: 1 item.
+Order 100: id 1032-1041: 10 items.
+Order 101: id 1042-1057: 16 items.
+Order 102: id 1058-1066: 9 items.
+Order 103: id 1067-1082: 16 items.
+Order 104: id 1083-1087: 5 items.
+Order 105: id 1088-1099: 12 items.
+Order 106: id 1100-1102: 3 items.
+Order 107: id 1103-1115: 13 items.
+Order 108: id 1116-1134: 19 items.
+Order 109: id 1135-1143: 9 items.
+Order 110: id 1144-1157: 14 items.
+Order 111: id 1158-1177: 20 items. (1177-1158+1 = 20). OK.
+Order 112: id 1178-1193: 16 items.
+Order 113: id 1194-1201: 8 items.
+Order 114: id 1202-1209: 8 items.
+Order 115: id 1210-1226: 17 items.
+Order 116: id 1227-1242: 16 items.
+Order 117: id 1243-1244: 2 items.
+Order 118: id 1245-1262: 18 items.
+Order 119: id 1263-1279: 17 items.
+Order 120: id 1280-1289: 10 items.
+Order 121: id 1290-1307: 18 items.
+Order 122: id 1308-1320: 13 items.
+Order 123: id 1321-1330: 10 items.
+Order 124: id 1331-1340: 10 items.
+Order 125: id 1341: 1 item.
+Order 126: id 1342-1359: 18 items.
+Order 127: id 1360-1363: 4 items.
+Order 128: id 1364-1378: 15 items.
+Order 129: id 1379-1397: 19 items.
+Order 130: id 1398: 1 item.
+Order 131: id 1399-1408: 10 items.
+Order 132: id 1409-1421: 13 items.
+Order 133: id 1422-1440: 19 items.
+Order 134: id 1441-1448: 8 items.
+Order 135: id 1449-1450: 2 items.
+Order 136: id 1451-1459: 9 items.
+Order 137: id 1460-1472: 13 items.
+Order 138: id 1473-1483: 11 items.
+Order 139: id 1484-1497: 14 items.
+Order 140: id 1498-1509: 12 items.
+Order 141: id 1510-1516: 7 items.
+Order 142: id 1517-1523: 7 items.
+Order 143: id 1524-1526: 3 items.
+Order 144: id 1527-1544: 18 items.
+Order 145: id 1545-1563: 19 items.
+Order 146: id 1564-1581: 18 items.
+Order 147: id 1582-1590: 9 items.
+Order 148: id 1591: 1 item.
+Order 149: id 1592-1605: 14 items.
+Order 150: id 1606-1622: 17 items.
+Order 151: id 1623-1627: 5 items.
+Order 152: id 1628-1632: 5 items.
+Order 153: id 1633-1634: 2 items.
+Order 154: id 1635-1653: 19 items.
+Order 155: id 1654-1673: 20 items. (1673-1654+1 = 20). OK.
+Order 156: id 1674-1686: 13 items.
+
+So all orders have between 1 and 20 items inclusive. Cardinality for item count is fine.
+
+Now status transitions. Allowed pairs:
+(pending, shipped)
+(shipped, delivered)
+(pending, cancelled)
+(pending, pending) -- initial state
+
+Check each order's (prev_status, status). Note that for initial state, prev_status may be empty or NULL. In the CSV, some prev_status are empty (e.g., order 3: prev_status is empty, status pending). The trigger uses ARRAY[NEW.prev_status, NEW.status] = ANY (allowed). If prev_status is NULL, then ARRAY[NULL, 'pending'] would not match any of the allowed arrays which have text values. However, the trigger is on INSERT or UPDATE. In the data, some rows have empty prev_status. In PostgreSQL, an empty string '' is different from NULL. The CSV shows empty string for prev_status for some orders. Let's check the allowed array: it contains ['pending', 'pending'] but not ['', 'pending'] or [NULL, 'pending']. So if prev_status is empty string, the transition ('', pending) is not allowed. But maybe the empty string in CSV represents NULL? In CSV, an empty field can be NULL or empty string depending on interpretation. The DDL does not have a NOT NULL constraint on prev_status. The trigger function would treat NULL prev_status as ARRAY[NULL, 'pending'], which is not equal to any of the text arrays. So initial insert must set prev_status = 'pending' and status = 'pending' to be allowed. Let's check the orders with empty prev_status:
+
+Order 3: customer 2, status pending, prev_status empty.
+Order 30: customer 10, status pending, prev_status empty.
+Order 33: customer 11, status pending, prev_status empty.
+Order 37: customer 12, status pending, prev_status empty.
+Order 45: customer 16, status pending, prev_status empty.
+Order 62: customer 20, status pending, prev_status empty.
+Order 73: customer 24, status pending, prev_status empty.
+Order 74: customer 24, status pending, prev_status empty.
+Order 88: customer 27, status pending, prev_status empty.
+Order 93: customer 29, status pending, prev_status empty.
+Order 94: customer 29, status pending, prev_status empty.
+Order 100: customer 31, status pending, prev_status empty.
+Order 118: customer 36, status pending, prev_status empty.
+Order 128: customer 38, status pending, prev_status empty.
+Order 136: customer 40, status pending, prev_status empty.
+Order 141: customer 43, status pending, prev_status empty.
+Order 145: customer 46, status pending, prev_status empty.
+Order 148: customer 47, status pending, prev_status empty.
+Order 150: customer 47, status pending, prev_status empty.
+Order 153: customer 49, status pending, prev_status empty.
+
+If empty prev_status is treated as NULL or empty string, then (NULL/empty, pending) is not in the allowed set. The allowed set only has (pending, pending). So these would be illegal transitions. However, maybe the empty string is just a CSV representation of NULL, and the trigger would have prevented insertion unless prev_status was set to 'pending'. But the data shows empty. The problem statement says "the pair (prev_status, status) of every order lies in the allowed set". So we must check the actual values. If prev_status is empty/NULL, then the pair is ('', pending) or (NULL, pending), which is not in the allowed set. But wait: the allowed set includes (pending, pending). For an initial state, the application might set prev_status = 'pending' and status = 'pending'. In the CSV, some pending orders have prev_status = 'pending' (e.g., order 1: prev_status pending, status shipped; order 2: prev_status pending, status shipped). But the ones with empty prev_status are likely initial inserts where prev_status was not set. The trigger would reject them. So this is a transition_break.
+
+But we need to be careful: is empty string considered equal to 'pending'? No. Is it considered NULL? In CSV, empty field could be NULL. The trigger uses ARRAY[NEW.prev_status, NEW.status]. If NEW.prev_status is NULL, ARRAY[NULL, 'pending'] is not equal to ARRAY['pending','pending'] because NULL != 'pending'. So it would raise exception. Therefore, any order with prev_status NULL/empty and status pending is an illegal transition.
+
+However, maybe the problem expects us to treat empty prev_status as 'pending'? The rules say: "Status transition: the pair (prev_status, status) of every order lies in the allowed set {(pending, shipped), (shipped, delivered), (pending, cancelled), (pending, pending)}." So the pair must be exactly one of those. If prev_status is empty, it's not 'pending', so it's not allowed. Thus we have a transition_break.
+
+But before concluding, let's check if there are any other transition violations. For non-empty prev_status:
+
+Order 1: (pending, shipped) OK.
+Order 2: (pending, shipped) OK.
+Order 4: (shipped, delivered) OK.
+Order 5: (shipped, delivered) OK.
+Order 6: (shipped, delivered) OK.
+Order 7: (pending, cancelled) OK.
+Order 8: (pending, cancelled) OK.
+Order 9: (shipped, delivered) OK.
+Order 10: (shipped, delivered) OK.
+Order 11: (shipped, delivered) OK.
+Order 12: (pending, cancelled) OK.
+Order 13: (pending, shipped) OK.
+Order 14: (shipped, delivered) OK.
+Order 15: (shipped, delivered) OK.
+Order 16: (shipped, delivered) OK.
+Order 17: (pending, cancelled) OK.
+Order 18: (pending, shipped) OK.
+Order 19: (shipped, delivered) OK.
+Order 20: (shipped, delivered) OK.
+Order 21: (shipped, delivered) OK.
+Order 22: (shipped, delivered) OK.
+Order 23: (shipped, delivered) OK.
+Order 24: (pending, shipped) OK.
+Order 25: (shipped, delivered) OK.
+Order 26: (pending, cancelled) OK.
+Order 27: (pending, shipped) OK.
+Order 28: (pending, shipped) OK.
+Order 29: (pending, shipped) OK.
+Order 31: (pending, shipped) OK.
+Order 32: (shipped, delivered) OK.
+Order 34: (pending, shipped) OK.
+Order 35: (pending, shipped) OK.
+Order 36: (pending, shipped) OK.
+Order 38: (shipped, delivered) OK.
+Order 39: (pending, cancelled) OK.
+Order 40: (pending, shipped) OK.
+Order 41: (shipped, delivered) OK.
+Order 42: (shipped, delivered) OK.
+Order 43: (pending, cancelled) OK.
+Order 44: (pending, cancelled) OK.
+Order 46: (pending, shipped) OK.
+Order 47: (shipped, delivered) OK.
+Order 48: (pending, cancelled) OK.
+Order 49: (shipped, delivered) OK.
+Order 50: (shipped, delivered) OK.
+Order 51: (shipped, delivered) OK.
+Order 52: (shipped, delivered) OK.
+Order 53: (pending, cancelled) OK.
+Order 54: (pending, cancelled) OK.
+Order 55: (shipped, delivered) OK.
+Order 56: (shipped, delivered) OK.
+Order 57: (pending, cancelled) OK.
+Order 58: (pending, cancelled) OK.
+Order 59: (shipped, delivered) OK.
+Order 60: (pending, cancelled) OK.
+Order 61: (pending, cancelled) OK.
+Order 63: (pending, shipped) OK.
+Order 64: (pending, cancelled) OK.
+Order 65: (shipped, delivered) OK.
+Order 66: (pending, shipped) OK.
+Order 67: (shipped, delivered) OK.
+Order 68: (pending, cancelled) OK.
+Order 69: (shipped, delivered) OK.
+Order 70: (shipped, delivered) OK.
+Order 71: (pending, shipped) OK.
+Order 72: (pending, cancelled) OK.
+Order 75: (pending, shipped) OK.
+Order 76: (shipped, delivered) OK.
+Order 77: (pending, cancelled) OK.
+Order 78: (pending, shipped) OK.
+Order 79: (pending, shipped) OK.
+Order 80: (pending, shipped) OK.
+Order 81: (pending, cancelled) OK.
+Order 82: (pending, cancelled) OK.
+Order 83: (shipped, delivered) OK.
+Order 84: (pending, cancelled) OK.
+Order 85: (pending, cancelled) OK.
+Order 86: (shipped, delivered) OK.
+Order 87: (shipped, delivered) OK.
+Order 89: (pending, cancelled) OK.
+Order 90: (pending, cancelled) OK.
+Order 91: (shipped, delivered) OK.
+Order 92: (shipped, delivered) OK.
+Order 95: (shipped, delivered) OK.
+Order 96: (pending, cancelled) OK.
+Order 97: (shipped, delivered) OK.
+Order 98: (shipped, delivered) OK.
+Order 99: (shipped, delivered) OK.
+Order 101: (pending, shipped) OK.
+Order 102: (shipped, delivered) OK.
+Order 103: (pending, cancelled) OK.
+Order 104: (shipped, delivered) OK.
+Order 105: (shipped, delivered) OK.
+Order 106: (shipped, delivered) OK.
+Order 107: (shipped, delivered) OK.
+Order 108: (shipped, delivered) OK.
+Order 109: (shipped, delivered) OK.
+Order 110: (pending, cancelled) OK.
+Order 111: (shipped, delivered) OK.
+Order 112: (shipped, delivered) OK.
+Order 113: (shipped, delivered) OK.
+Order 114: (pending, cancelled) OK.
+Order 115: (shipped, delivered) OK.
+Order 116: (shipped, delivered) OK.
+Order 117: (pending, shipped) OK.
+Order 119: (shipped, delivered) OK.
+Order 120: (shipped, delivered) OK.
+Order 121: (shipped, delivered) OK.
+Order 122: (pending, shipped) OK.
+Order 123: (pending, shipped) OK.
+Order 124: (shipped, delivered) OK.
+Order 125: (shipped, delivered) OK.
+Order 126: (pending, cancelled) OK.
+Order 127: (shipped, delivered) OK.
+Order 129: (pending, cancelled) OK.
+Order 130: (shipped, delivered) OK.
+Order 131: (pending, shipped) OK.
+Order 132: (pending, cancelled) OK.
+Order 133: (pending, cancelled) OK.
+Order 134: (pending, cancelled) OK.
+Order 135: (shipped, delivered) OK.
+Order 137: (pending, shipped) OK.
+Order 138: (shipped, delivered) OK.
+Order 139: (pending, cancelled) OK.
+Order 140: (pending, shipped) OK.
+Order 142: (shipped, delivered) OK.
+Order 143: (pending, shipped) OK.
+Order 144: (pending, shipped) OK.
+Order 147: (pending, cancelled) OK.
+Order 149: (pending, shipped) OK.
+Order 151: (shipped, delivered) OK.
+Order 152: (pending, cancelled) OK.
+Order 154: (pending, shipped) OK.
+Order 155: (pending, shipped) OK.
+Order 156: (pending, shipped) OK.
+
+So the only potential transition violations are the ones with empty prev_status. There are many. So transition_break seems likely.
+
+But wait: the problem says "prev_status" is a column in orders. The trigger checks ARRAY[NEW.prev_status, NEW.status] = ANY (allowed). In PostgreSQL, if prev_status is NULL, the array contains NULL. The equality operator for arrays with NULL elements returns NULL (not true). So the IF NOT condition would be true (since NULL is not true), and it would raise exception. If prev_status is empty string '', then ARRAY['', 'pending'] is definitely not equal to any of the allowed arrays. So either way, it's illegal.
+
+However, is it possible that the empty fields in CSV are meant to be NULL, and the rule for initial state is that prev_status can be NULL? The trigger explicitly does not allow NULL. The problem statement says: "the pair (prev_status, status) of every order lies in the allowed set". It doesn't mention NULL. So we must treat empty as not 'pending'. Thus transition_break.
+
+But before finalizing, we should check if there are any derivation breaks, because the problem might be designed to have a derivation break instead. However, the presence of many empty prev_status is a glaring issue. But maybe the empty string is just a display issue and we should treat it as 'pending'? Let's read the problem carefully.
+
+The trigger function:
+```sql
+    allowed CONSTANT TEXT[][] := ARRAY[
+        ['pending',   'shipped'],
+        ['shipped',   'delivered'],
+        ['pending',   'cancelled'],
+        ['pending',   'pending']     -- initial state
+    ];
+BEGIN
+    IF NOT (ARRAY[NEW.prev_status, NEW.status] = ANY (allowed))
+    THEN
+        RAISE EXCEPTION 'illegal transition % -> %',
+            NEW.prev_status, NEW.status;
+    END IF;
+```
+
+This is procedural. The problem says "Status transition: the pair (prev_status, status) of every order lies in the allowed set". So we must apply that rule. The empty string is not in the allowed set. So it's a transition_break.
+
+But is there any chance that the empty fields are actually NULL and the problem expects us to treat NULL as a valid initial prev_status? The trigger would not allow it, but maybe the data was generated without the trigger? The problem says "A state is LEGAL iff every one of the following holds." It lists the rules. The status transition rule is explicit: the pair must lie in the allowed set. So NULL/empty is not allowed.
+
+Thus the state is ILLEGAL with violation transition_break.
+
+However, we should double-check if there might be a derivation break that is the "intended" answer, and maybe the empty prev_status is considered 'pending' implicitly. But the problem statement is quite precise. Let's see if there are any orders with prev_status empty but status not pending. Looking at the list, all empty prev_status have status pending. So they are initial states. The allowed initial state is (pending, pending). So if the application code set prev_status to empty/NULL instead of 'pending', it's a violation.
+
+But maybe the CSV omits the value 'pending' for prev_status when it's the initial state, and we are supposed to infer it? The problem says "Database state, presented as the contents of three CSV files". The CSV literally has empty fields. In database terms, that could be NULL. The trigger would reject it. So it's illegal.
+
+Let's also quickly check if there are any FK breaks. orders.customer_id ranges 1-50, all present. order_items.order_id ranges 1-156, all present? Let's verify the max order_id in order_items. The last few items: 1684,156,... 1686,156. So yes, all order_ids in items are between 1 and 156. No FK break.
+
+Cardinalities: per-customer open orders <=3, checked. Per-order item count 1-20, checked.
+
+So the only violations are transition. But to be thorough, let's check a few derivations to see if they are correct. If derivations are also wrong, we still need to report one violation. The first violation we find determines the answer? The problem says "A single violation makes the state ILLEGAL". And we need to output the violation type. If multiple, any? It says "where X is one of fk_break, cardinality_break, derivation_break, transition_break". It doesn't specify which one if multiple. But presumably we should output the one that actually occurs. If multiple occur, maybe any is acceptable? But likely the state has only one type of violation. Let's verify a few derivations to ensure they are correct, so that transition is indeed the only issue.
+
+Let's compute a few simple orders.
+
+Order 1: customer 1 (country OTHER, tier silver). Tax for OTHER = 0.15.
+Items:
+1: product 6, qty 8, unit_price 362.27. Tier silver, qty 8 => discount 0.10. line_total = 8 * 362.27 * (1-0.10) = 8 * 362.27 * 0.9 = 8 * 326.043 = 2608.344. Matches.
+2: qty 7, unit_price 269.94. discount 0.10. 7 * 269.94 * 0.9 = 7 * 242.946 = 1700.622. Matches.
+3: qty 2, unit_price 433.98. discount 0.05 (silver, qty 2). 2 * 433.98 * 0.95 = 2 * 412.281 = 824.562. Matches.
+4: qty 5, unit_price 78.2. discount 0.10. 5 * 78.2 * 0.9 = 5 * 70.38 = 351.9. Matches.
+5: qty 5, unit_price 126.87. discount 0.10. 5 * 126.87 * 0.9 = 5 * 114.183 = 570.915. Matches.
+Sum line_total = 2608.344 + 1700.622 + 824.562 + 351.9 + 570.915 = let's add:
+2608.344 + 1700.622 = 4308.966
++824.562 = 5133.528
++351.9 = 5485.428
++570.915 = 6056.343
+Order total = sum * (1 + tax) = 6056.343 * 1.15 = 6964.79445. Matches exactly! So derivation is correct for order 1.
+
+Order 2: customer 2 (FR, gold). Tax 0.20.
+Items:
+6: qty 8, unit_price 453.23. Gold, qty 8 => discount 0.15. 8 * 453.23 * 0.85 = 8 * 385.2455 = 3081.964. Matches.
+7: qty 6, unit_price 100.31. Gold, qty 6 => discount 0.15. 6 * 100.31 * 0.85 = 6 * 85.2635 = 511.581. Matches.
+8: qty 4, unit_price 85.84. Gold, qty 4 => discount 0.10. 4 * 85.84 * 0.9 = 4 * 77.256 = 309.024. Matches.
+9: qty 2, unit_price 112.4. Gold, qty 2 => discount 0.10. 2 * 112.4 * 0.9 = 2 * 101.16 = 202.32. Matches.
+10: qty 6, unit_price 30.66. discount 0.15. 6 * 30.66 * 0.85 = 6 * 26.061 = 156.366. Matches.
+11: qty 9, unit_price 65.71. discount 0.15. 9 * 65.71 * 0.85 = 9 * 55.8535 = 502.6815. Matches.
+12: qty 1, unit_price 410.93. discount 0.10. 1 * 410.93 * 0.9 = 369.837. Matches.
+13: qty 8, unit_price 388.72. discount 0.15. 8 * 388.72 * 0.85 = 8 * 330.412 = 2643.296. Matches.
+14: qty 5, unit_price 333.02. discount 0.15. 5 * 333.02 * 0.85 = 5 * 283.067 = 1415.335. Matches.
+Sum = 3081.964 + 511.581 + 309.024 + 202.32 + 156.366 + 502.6815 + 369.837 + 2643.296 + 1415.335
+Let's sum:
+3081.964 + 511.581 = 3593.545
++309.024 = 3902.569
++202.32 = 4104.889
++156.366 = 4261.255
++502.6815 = 4763.9365
++369.837 = 5133.7735
++2643.296 = 7777.0695
++1415.335 = 9192.4045
+Total = 9192.4045 * (1 + 0.20) = 9192.4045 * 1.2 = 11030.8854. Matches exactly.
+
+So derivations are correct.
+
+Given that orders with empty prev_status are clearly violating the transition rule, the state is ILLEGAL, violation transition_break.
+
+But let's double-check: is there any order where prev_status is empty but the transition is allowed? No, because allowed pairs all have prev_status = 'pending' or 'shipped'. Empty is neither.
+
+One might argue that empty prev_status means the order is newly inserted and the pair should be considered (pending, pending). But the data shows prev_status is empty, not 'pending'. The rule is explicit: the pair (prev_status, status) must be in the set. So it's a violation.
+
+Thus answer: {"label": "ILLEGAL", "violation": "transition_break"}
+
+Wait, but I should check if there is any order with prev_status = 'delivered' or 'cancelled'. That would also be a violation. Let's scan:
+
+Looking at orders.csv, prev_status values are: pending, shipped, or empty. No delivered or cancelled prev_status. So only empty ones are problematic.
+
+Therefore, the classification is ILLEGAL due to transition_break.
+
+But I want to be absolutely sure about the empty fields. In the CSV, they appear as:
+3,2,pending,,2022-12-21,29725.4304
+
+This is a typical CSV representation of an empty string. In SQL, if the column is VARCHAR, an empty string is a valid value. The trigger compares the exact value. So it's illegal.
+
+Even if interpreted as NULL, it's illegal.
+
+Thus final answer: {"label":"ILLEGAL","violation":"transition_break"}
+
+One more check: is there any possibility that the problem expects us to treat empty as 'pending' because it's the "initial state"? The trigger comment says "-- initial state" on the (pending,pending) pair. The application code might set prev_status to NULL for initial state, but the trigger would reject it. Since the trigger is part of the rule set, and the problem says "Status transition: the pair (prev_status, status) of every order lies in the allowed set", we must enforce it strictly.
+
+Therefore, the answer is as above.
+
+I will output the JSON.

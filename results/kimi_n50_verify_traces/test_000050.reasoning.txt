@@ -1,0 +1,848 @@
+We need to verify whether the given database state is LEGAL according to the four rules: referential integrity, cardinality (1-20 line items per order, at most 3 open orders per customer), derivation (line_total and order.total), and status transition.
+
+We have three CSV files: customers (50 rows), orders (134 rows), order_items (1477 rows). We need to check each rule.
+
+First, referential integrity:
+- Every orders.customer_id must be in customers.id. customers.id are 1..50. orders.customer_id range 1..50. Let's verify all present. Since customers.csv has ids 1-50, and orders.customer_id are within 1-50, this should be fine. But we need to check if any missing? The customers list is complete 1-50. So FK orders->customers holds.
+- Every order_items.order_id must be in orders.id. orders.id are 1..134. order_items.order_id range 1..134? Let's check. The order_items.csv has order_id values. We need to ensure no order_id >134 or missing. Looking at the data, the last few items have order_id 134. It seems all order_ids are within 1..134. But we need to check if any order_id is missing? The rule is every order_items.order_id occurs in orders.id. Since orders.id are 1..134, and order_items.order_id seems to be within that, it's okay. But we need to check if there are any order_ids in order_items that are not in orders. Let's scan: order_items go up to 134. I see order_id 134 present. So FK holds.
+
+Second, cardinality:
+- Each order has 1-20 line items. We need to count items per order. There are 134 orders. We need to check that every order has at least 1 and at most 20 items. Let's count. We can try to count from the CSV. Since there are 1477 items, average about 11 per order. But we need to verify none have 0 or >20. Since the data is large, we need to be careful. We can try to compute counts per order by scanning the order_items. But doing it manually for 1477 rows is error-prone. However, we can look for anomalies. The problem likely has a specific violation. Let's check other rules first to see if we can find a violation.
+
+Third, derivation:
+- line_total = quantity * unit_price * (1 - discount(tier, quantity))
+- discount depends on tier and quantity bucket:
+  bronze: [1,4]:0.00, [5,9]:0.05, [10,19]:0.07
+  silver: [1,4]:0.05, [5,9]:0.10, [10,19]:0.12
+  gold:   [1,4]:0.10, [5,9]:0.15, [10,19]:0.20
+  Note: quantity always in [1,20]; max bucket closed at 19, quantity=20 is a per-order cardinality bound, not a discount band. What about quantity=20? The table doesn't specify discount for qty=20. The text says "quantity is always in [1, 20]; the maximum bucket is closed at 19, and quantity = 20 is a per-order cardinality bound, not a discount band." This implies discount for qty=20 is not defined in the table. But maybe the application code handles it? The rule says "discount(tier, quantity) is the following table" with buckets [1,4], [5,9], [10,19]. It doesn't specify qty=20. However, the per-order item count says each order must have between 1 and 20 line items inclusive. Quantity per line item is >0 and presumably can be up to 20? The check says quantity > 0. The discount table doesn't cover 20. Maybe quantity=20 gets the same discount as [10,19]? Or maybe there is no discount? The text says "the maximum bucket is closed at 19, and quantity = 20 is a per-order cardinality bound, not a discount band." This is ambiguous. But likely the discount for qty=20 is undefined, but maybe the data doesn't have quantity=20. Let's check if any quantity=20 appears. Scanning the order_items, I see quantities like 1,2,3,4,5,6,7,8,9,10. I don't see any 20. Maybe none. So we can ignore.
+
+- order.total = sum(line_total for items in this order) * (1 + tax(country))
+  tax(country): DE:0.19, FR:0.20, GB:0.20, JP:0.10, US:0.08, anything else:0.15.
+
+We need to verify these formulas for every row. That's a lot. But perhaps there is a violation that is easy to spot. Let's check some orders.
+
+First, let's map customer tier and country.
+Customers:
+1: OTHER, bronze
+2: US, silver
+3: FR, bronze
+4: DE, bronze
+5: OTHER, bronze
+6: JP, gold
+7: US, bronze
+8: JP, silver
+9: OTHER, bronze
+10: JP, gold
+11: DE, silver
+12: JP, silver
+13: DE, silver
+14: DE, gold
+15: JP, bronze
+16: GB, silver
+17: OTHER, gold
+18: JP, gold
+19: OTHER, gold
+20: FR, silver
+21: GB, silver
+22: US, bronze
+23: OTHER, silver
+24: OTHER, bronze
+25: US, gold
+26: FR, gold
+27: OTHER, bronze
+28: JP, gold
+29: DE, silver
+30: GB, gold
+31: DE, bronze
+32: JP, gold
+33: OTHER, gold
+34: OTHER, silver
+35: JP, silver
+36: DE, gold
+37: GB, gold
+38: OTHER, gold
+39: JP, silver
+40: DE, silver
+41: DE, gold
+42: JP, gold
+43: OTHER, silver
+44: OTHER, bronze
+45: GB, gold
+46: DE, bronze
+47: DE, silver
+48: FR, gold
+49: DE, gold
+50: US, bronze
+
+Now orders:
+Let's list order id, customer_id, status, prev_status, total.
+1: cust1, shipped, pending, total 9047.5606
+2: cust1, shipped, pending, total 24709.70385
+3: cust2, pending, null, total 22447.53162
+4: cust3, delivered, shipped, total 22810.3272
+5: cust3, shipped, pending, total 29957.2182
+6: cust4, cancelled, pending, total 34267.42683
+7: cust4, shipped, pending, total 27100.556035
+8: cust5, delivered, shipped, total 19398.65425
+9: cust5, delivered, shipped, total 12058.893675
+10: cust5, shipped, pending, total 24916.679125
+11: cust5, shipped, pending, total 16606.850425
+12: cust5, pending, null, total 15464.11785
+13: cust6, cancelled, pending, total 22793.48115
+14: cust6, cancelled, pending, total 15131.71605
+15: cust6, delivered, shipped, total 8964.49345
+16: cust6, cancelled, pending, total 12028.28715
+17: cust6, pending, null, total 5253.0082
+18: cust7, pending, null, total 19636.74738
+19: cust8, shipped, pending, total 25099.8506
+20: cust8, pending, null, total 24036.8051
+21: cust8, shipped, pending, total 25962.89465
+22: cust9, delivered, shipped, total 9710.114125
+23: cust9, delivered, shipped, total 15787.283375
+24: cust9, delivered, shipped, total 4769.143725
+25: cust9, delivered, shipped, total 6811.933575
+26: cust10, pending, null, total 9540.30825
+27: cust11, cancelled, pending, total 36669.077095
+28: cust11, delivered, shipped, total 1155.06279
+29: cust11, delivered, shipped, total 30215.884405
+30: cust12, delivered, shipped, total 7605.27295
+31: cust12, delivered, shipped, total 3732.0272
+32: cust13, cancelled, pending, total 8017.34535
+33: cust13, delivered, shipped, total 18824.873585
+34: cust13, pending, null, total 17158.612975
+35: cust14, delivered, shipped, total 18350.671675
+36: cust14, delivered, shipped, total 26060.15986
+37: cust14, cancelled, pending, total 27748.038605
+38: cust14, delivered, shipped, total 21746.710335
+39: cust14, pending, null, total 12109.780935
+40: cust15, cancelled, pending, total 2620.3243
+41: cust15, shipped, pending, total 16442.36
+42: cust16, delivered, shipped, total 10639.6164
+43: cust16, pending, null, total 25009.3794
+44: cust17, delivered, shipped, total 16755.46665
+45: cust17, delivered, shipped, total 20081.025725
+46: cust17, delivered, shipped, total 24708.240475
+47: cust18, delivered, shipped, total 462.3993
+48: cust18, cancelled, pending, total 24945.2071
+49: cust18, pending, null, total 8804.0964
+50: cust19, delivered, shipped, total 38863.662925
+51: cust19, shipped, pending, total 13864.275225
+52: cust19, pending, null, total 14851.4128
+53: cust20, delivered, shipped, total 14836.4364
+54: cust20, delivered, shipped, total 27304.6356
+55: cust20, shipped, pending, total 1898.8752
+56: cust21, cancelled, pending, total 22655.5116
+57: cust22, delivered, shipped, total 19856.80872
+58: cust22, pending, null, total 28424.42226
+59: cust22, pending, null, total 11701.79676
+60: cust23, shipped, pending, total 939.1889
+61: cust23, shipped, pending, total 14589.22545
+62: cust24, delivered, shipped, total 13284.663725
+63: cust24, delivered, shipped, total 27521.22385
+64: cust24, shipped, pending, total 11013.3338
+65: cust25, delivered, shipped, total 9819.54036
+66: cust26, shipped, pending, total 11078.1504
+67: cust27, pending, null, total 1632.1467
+68: cust27, shipped, pending, total 12183.101725
+69: cust28, delivered, shipped, total 31725.8282
+70: cust28, delivered, shipped, total 3516.2083
+71: cust28, delivered, shipped, total 8578.18555
+72: cust28, delivered, shipped, total 24603.50475
+73: cust29, cancelled, pending, total 28158.563615
+74: cust29, delivered, shipped, total 16047.05956
+75: cust29, delivered, shipped, total 16198.17647
+76: cust30, delivered, shipped, total 25732.9884
+77: cust30, cancelled, pending, total 487.3932
+78: cust30, pending, null, total 4315.7268
+79: cust30, shipped, pending, total 8231.3286
+80: cust31, delivered, shipped, total 1396.03541
+81: cust32, delivered, shipped, total 8450.2781
+82: cust33, pending, null, total 10801.4762
+83: cust33, shipped, pending, total 13670.02585
+84: cust34, shipped, pending, total 32083.32215
+85: cust34, shipped, pending, total 11061.9765
+86: cust35, shipped, pending, total 18983.76755
+87: cust36, delivered, shipped, total 20868.470105
+88: cust36, delivered, shipped, total 17980.575725
+89: cust36, delivered, shipped, total 27596.96275
+90: cust36, pending, null, total 5097.068095
+91: cust36, shipped, pending, total 25813.38242
+92: cust37, shipped, pending, total 6436.6434
+93: cust38, delivered, shipped, total 28072.54535
+94: cust38, shipped, pending, total 16710.724175
+95: cust39, cancelled, pending, total 3516.92495
+96: cust39, delivered, shipped, total 22211.9821
+97: cust39, shipped, pending, total 17391.6666
+98: cust39, pending, null, total 25512.42595
+99: cust39, pending, null, total 21729.78225
+100: cust40, delivered, shipped, total 22143.24511
+101: cust40, delivered, shipped, total 17929.174865
+102: cust40, delivered, shipped, total 24056.7187
+103: cust40, shipped, pending, total 16402.89693
+104: cust40, pending, null, total 26123.467265
+105: cust41, pending, null, total 9213.13827
+106: cust42, cancelled, pending, total 472.362
+107: cust42, delivered, shipped, total 13303.17395
+108: cust42, shipped, pending, total 21248.1687
+109: cust42, shipped, pending, total 5068.7054
+110: cust42, shipped, pending, total 20054.71875
+111: cust43, delivered, shipped, total 4793.4852
+112: cust43, delivered, shipped, total 22393.780375
+113: cust43, delivered, shipped, total 18811.68275
+114: cust43, shipped, pending, total 23939.580475
+115: cust43, pending, null, total 3247.28145
+116: cust44, delivered, shipped, total 8794.47205
+117: cust44, delivered, shipped, total 23775.749175
+118: cust44, cancelled, pending, total 2187.538625
+119: cust44, shipped, pending, total 20457.161975
+120: cust45, pending, null, total 21952.6566
+121: cust46, pending, null, total 9610.9993
+122: cust46, pending, null, total 27362.84572
+123: cust46, pending, null, total 3519.433925
+124: cust47, cancelled, pending, total 16496.60824
+125: cust47, delivered, shipped, total 16021.021765
+126: cust47, delivered, shipped, total 6324.278205
+127: cust48, delivered, shipped, total 3271.632
+128: cust49, delivered, shipped, total 3472.14987
+129: cust49, delivered, shipped, total 15790.16712
+130: cust49, pending, null, total 20680.53281
+131: cust49, shipped, pending, total 33058.82356
+132: cust49, shipped, pending, total 4165.55216
+133: cust50, cancelled, pending, total 8535.27996
+134: cust50, shipped, pending, total 6324.92226
+
+Now, open-order limit: at most 3 open orders per customer. Open = status in {pending, shipped}.
+Let's count open orders per customer.
+
+Cust1: orders 1(shipped),2(shipped). Open=2. OK.
+Cust2: order 3(pending). Open=1. OK.
+Cust3: orders 4(delivered),5(shipped). Open=1. OK.
+Cust4: orders 6(cancelled),7(shipped). Open=1. OK.
+Cust5: orders 8(delivered),9(delivered),10(shipped),11(shipped),12(pending). Open=3. OK.
+Cust6: orders 13(cancelled),14(cancelled),15(delivered),16(cancelled),17(pending). Open=1. OK.
+Cust7: order 18(pending). Open=1. OK.
+Cust8: orders 19(shipped),20(pending),21(shipped). Open=3. OK.
+Cust9: orders 22-25 all delivered. Open=0. OK.
+Cust10: order 26(pending). Open=1. OK.
+Cust11: orders 27(cancelled),28(delivered),29(delivered). Open=0. OK.
+Cust12: orders 30(delivered),31(delivered). Open=0. OK.
+Cust13: orders 32(cancelled),33(delivered),34(pending). Open=1. OK.
+Cust14: orders 35(delivered),36(delivered),37(cancelled),38(delivered),39(pending). Open=1. OK.
+Cust15: orders 40(cancelled),41(shipped). Open=1. OK.
+Cust16: orders 42(delivered),43(pending). Open=1. OK.
+Cust17: orders 44-46 all delivered. Open=0. OK.
+Cust18: orders 47(delivered),48(cancelled),49(pending). Open=1. OK.
+Cust19: orders 50(delivered),51(shipped),52(pending). Open=2. OK.
+Cust20: orders 53(delivered),54(delivered),55(shipped). Open=1. OK.
+Cust21: order 56(cancelled). Open=0. OK.
+Cust22: orders 57(delivered),58(pending),59(pending). Open=2. OK.
+Cust23: orders 60(shipped),61(shipped). Open=2. OK.
+Cust24: orders 62(delivered),63(delivered),64(shipped). Open=1. OK.
+Cust25: order 65(delivered). Open=0. OK.
+Cust26: order 66(shipped). Open=1. OK.
+Cust27: orders 67(pending),68(shipped). Open=2. OK.
+Cust28: orders 69-72 all delivered. Open=0. OK.
+Cust29: orders 73(cancelled),74(delivered),75(delivered). Open=0. OK.
+Cust30: orders 76(delivered),77(cancelled),78(pending),79(shipped). Open=2. OK.
+Cust31: order 80(delivered). Open=0. OK.
+Cust32: order 81(delivered). Open=0. OK.
+Cust33: orders 82(pending),83(shipped). Open=2. OK.
+Cust34: orders 84(shipped),85(shipped). Open=2. OK.
+Cust35: order 86(shipped). Open=1. OK.
+Cust36: orders 87(delivered),88(delivered),89(delivered),90(pending),91(shipped). Open=2. OK.
+Cust37: order 92(shipped). Open=1. OK.
+Cust38: orders 93(delivered),94(shipped). Open=1. OK.
+Cust39: orders 95(cancelled),96(delivered),97(shipped),98(pending),99(pending). Open=3. OK.
+Cust40: orders 100(delivered),101(delivered),102(delivered),103(shipped),104(pending). Open=2. OK.
+Cust41: order 105(pending). Open=1. OK.
+Cust42: orders 106(cancelled),107(delivered),108(shipped),109(shipped),110(shipped). Open=3. OK.
+Cust43: orders 111(delivered),112(delivered),113(delivered),114(shipped),115(pending). Open=2. OK.
+Cust44: orders 116(delivered),117(delivered),118(cancelled),119(shipped). Open=1. OK.
+Cust45: order 120(pending). Open=1. OK.
+Cust46: orders 121(pending),122(pending),123(pending). Open=3. OK.
+Cust47: orders 124(cancelled),125(delivered),126(delivered). Open=0. OK.
+Cust48: order 127(delivered). Open=0. OK.
+Cust49: orders 128(delivered),129(delivered),130(pending),131(shipped),132(shipped). Open=3. OK.
+Cust50: orders 133(cancelled),134(shipped). Open=1. OK.
+
+So open-order limit seems satisfied for all customers. Good.
+
+Now status transitions: pair (prev_status, status) must be in allowed set:
+{(pending, shipped), (shipped, delivered), (pending, cancelled), (pending, pending)}.
+Note that prev_status can be null? In the CSV, prev_status is empty for some rows (e.g., order 3). The trigger checks ARRAY[NEW.prev_status, NEW.status] = ANY(allowed). If prev_status is null, then ARRAY[null, 'pending'] would not match any of the allowed text arrays. However, the trigger is on BEFORE INSERT OR UPDATE. In the data, some rows have empty prev_status. How does the CSV represent null? It's empty. In PostgreSQL, an empty string is not null. But the CSV might represent null as empty. The trigger function uses ARRAY[NEW.prev_status, NEW.status]. If prev_status is an empty string '', then ARRAY['', 'pending'] is not in allowed. But maybe the application sets prev_status to null for initial orders. The allowed set includes ['pending','pending'] which might be the initial state? Actually the comment says "initial state" for (pending,pending). But what about prev_status being null? The trigger doesn't allow null. However, the DDL does not have a NOT NULL constraint on prev_status. The trigger as written would raise exception if prev_status is null because ARRAY[NULL, 'pending'] = ANY(array of text arrays) yields NULL, and NOT NULL is false? Wait: In PostgreSQL, NULL = ANY(array) returns NULL (unknown). Then IF NOT NULL evaluates to true? Let's recall: In PL/pgSQL, IF NOT (NULL) then ... The condition "NOT NULL" is NULL, which is treated as false in IF. Actually in PL/pgSQL, a boolean expression that is NULL is treated as false in IF statements? Let's check: In PostgreSQL, IF boolean_expression THEN ... END IF; If the expression is NULL, it is treated as false. So IF NOT (NULL) THEN ... would be IF NULL THEN ... which is false, so it would not raise exception. Wait, need to be precise.
+
+The code:
+IF NOT (ARRAY[NEW.prev_status, NEW.status] = ANY (allowed))
+THEN
+    RAISE EXCEPTION ...
+END IF;
+
+If NEW.prev_status is NULL, then ARRAY[NULL, 'pending'] results in an array with NULL element. Then = ANY(allowed) compares with each allowed array. The equality of arrays with NULL elements: ARRAY[NULL, 'pending'] = ARRAY['pending','shipped'] yields NULL (because NULL = 'pending' is NULL). So the = ANY returns NULL (since any comparison returning true makes it true, but if none are true and at least one is NULL, result is NULL). Actually = ANY: returns true if any equal, false if none equal and no NULLs, NULL if none equal but some NULL. Here, comparing with each allowed array: none will be equal because first element is NULL vs 'pending', 'shipped', etc. So result is NULL. Then NOT NULL is NULL. The IF statement treats NULL as false, so it does NOT raise exception. Therefore null prev_status is allowed by the trigger! Interesting. So initial orders can have prev_status null and status pending. The allowed set doesn't need (null, pending). The trigger effectively allows any transition where prev_status is null, because the comparison yields NULL and NOT NULL is false. So the data with empty prev_status is okay.
+
+But we need to check that for rows where prev_status is not empty, the pair is in the allowed set. Let's check all orders with non-empty prev_status.
+
+Orders with prev_status = 'pending':
+1: (pending, shipped) OK
+2: (pending, shipped) OK
+4: (shipped, delivered) OK
+5: (pending, shipped) OK
+6: (pending, cancelled) OK
+7: (pending, shipped) OK
+8: (shipped, delivered) OK
+9: (shipped, delivered) OK
+10: (pending, shipped) OK
+11: (pending, shipped) OK
+13: (pending, cancelled) OK
+14: (pending, cancelled) OK
+15: (shipped, delivered) OK
+16: (pending, cancelled) OK
+19: (pending, shipped) OK
+21: (pending, shipped) OK
+28: (shipped, delivered) OK
+29: (shipped, delivered) OK
+30: (shipped, delivered) OK
+31: (shipped, delivered) OK
+32: (pending, cancelled) OK
+33: (shipped, delivered) OK
+35: (shipped, delivered) OK
+36: (shipped, delivered) OK
+37: (pending, cancelled) OK
+38: (shipped, delivered) OK
+40: (pending, cancelled) OK
+41: (pending, shipped) OK
+42: (shipped, delivered) OK
+44: (shipped, delivered) OK
+45: (shipped, delivered) OK
+46: (shipped, delivered) OK
+47: (shipped, delivered) OK
+48: (pending, cancelled) OK
+50: (shipped, delivered) OK
+51: (pending, shipped) OK
+53: (shipped, delivered) OK
+54: (shipped, delivered) OK
+55: (pending, shipped) OK
+56: (pending, cancelled) OK
+57: (shipped, delivered) OK
+60: (pending, shipped) OK
+61: (pending, shipped) OK
+62: (shipped, delivered) OK
+63: (shipped, delivered) OK
+64: (pending, shipped) OK
+65: (shipped, delivered) OK
+66: (pending, shipped) OK
+68: (pending, shipped) OK
+69: (shipped, delivered) OK
+70: (shipped, delivered) OK
+71: (shipped, delivered) OK
+72: (shipped, delivered) OK
+73: (pending, cancelled) OK
+74: (shipped, delivered) OK
+75: (shipped, delivered) OK
+76: (shipped, delivered) OK
+77: (pending, cancelled) OK
+79: (pending, shipped) OK
+80: (shipped, delivered) OK
+81: (shipped, delivered) OK
+83: (pending, shipped) OK
+84: (pending, shipped) OK
+85: (pending, shipped) OK
+86: (pending, shipped) OK
+87: (shipped, delivered) OK
+88: (shipped, delivered) OK
+89: (shipped, delivered) OK
+91: (pending, shipped) OK
+92: (pending, shipped) OK
+93: (shipped, delivered) OK
+94: (pending, shipped) OK
+95: (pending, cancelled) OK
+96: (shipped, delivered) OK
+97: (pending, shipped) OK
+100: (shipped, delivered) OK
+101: (shipped, delivered) OK
+102: (shipped, delivered) OK
+103: (pending, shipped) OK
+107: (shipped, delivered) OK
+108: (pending, shipped) OK
+109: (pending, shipped) OK
+110: (pending, shipped) OK
+111: (shipped, delivered) OK
+112: (shipped, delivered) OK
+113: (shipped, delivered) OK
+114: (pending, shipped) OK
+116: (shipped, delivered) OK
+117: (shipped, delivered) OK
+118: (pending, cancelled) OK
+119: (pending, shipped) OK
+124: (pending, cancelled) OK
+125: (shipped, delivered) OK
+126: (shipped, delivered) OK
+128: (shipped, delivered) OK
+129: (shipped, delivered) OK
+131: (pending, shipped) OK
+132: (pending, shipped) OK
+133: (pending, cancelled) OK
+134: (pending, shipped) OK
+
+Also check order 27: prev_status pending, status cancelled. OK.
+Order 39: pending, pending? Wait order 39: status pending, prev_status empty. That's okay.
+Order 49: pending, prev_status empty. OK.
+Order 58: pending, prev_status empty. OK.
+Order 59: pending, prev_status empty. OK.
+Order 67: pending, prev_status empty. OK.
+Order 78: pending, prev_status empty. OK.
+Order 82: pending, prev_status empty. OK.
+Order 90: pending, prev_status empty. OK.
+Order 98: pending, prev_status empty. OK.
+Order 99: pending, prev_status empty. OK.
+Order 104: pending, prev_status empty. OK.
+Order 105: pending, prev_status empty. OK.
+Order 115: pending, prev_status empty. OK.
+Order 120: pending, prev_status empty. OK.
+Order 121: pending, prev_status empty. OK.
+Order 122: pending, prev_status empty. OK.
+Order 123: pending, prev_status empty. OK.
+Order 130: pending, prev_status empty. OK.
+
+Wait, what about order 39? Actually order 39 is pending, prev_status empty. That's fine.
+What about order 12? pending, prev_status empty. OK.
+Order 17? pending, prev_status empty. OK.
+Order 18? pending, prev_status empty. OK.
+Order 20? pending, prev_status empty. OK.
+Order 26? pending, prev_status empty. OK.
+Order 34? pending, prev_status empty. OK.
+Order 43? pending, prev_status empty. OK.
+Order 52? pending, prev_status empty. OK.
+Order 67? pending, prev_status empty. OK.
+Order 78? pending, prev_status empty. OK.
+Order 82? pending, prev_status empty. OK.
+Order 90? pending, prev_status empty. OK.
+Order 98? pending, prev_status empty. OK.
+Order 99? pending, prev_status empty. OK.
+Order 104? pending, prev_status empty. OK.
+Order 105? pending, prev_status empty. OK.
+Order 115? pending, prev_status empty. OK.
+Order 120? pending, prev_status empty. OK.
+Order 121? pending, prev_status empty. OK.
+Order 122? pending, prev_status empty. OK.
+Order 123? pending, prev_status empty. OK.
+Order 130? pending, prev_status empty. OK.
+
+Are there any prev_status values not in {pending, shipped}? Looking at the CSV, prev_status is either empty, 'pending', or 'shipped'. So all non-empty are allowed as first element. And status is always one of the four enum values. So transition rule seems satisfied.
+
+Now cardinality: each order must have 1-20 line items. Let's verify counts. We need to ensure no order has 0 items or >20 items. Since there are 134 orders and 1477 items, average 11.02. It's plausible all are within 1-20. But we need to be sure. Let's try to count items per order by scanning the order_items. We can group by order_id.
+
+I'll go through the order_items list and tally counts. This is tedious but necessary. Maybe we can find a violation in derivation instead, which might be easier to spot. But let's see.
+
+Actually, the problem might have a subtle violation in derivation. Let's check a few orders to see if totals match.
+
+We need to compute line_total for each item and sum, then multiply by (1+tax). Let's pick some orders and compute.
+
+Order 1: customer_id 1 (bronze, OTHER => tax 0.15). Items:
+1: id1, prod36, qty1, unit_price 399.57, line_total 399.57. Bronze, qty1 => discount 0.00. So line_total = 1*399.57*1 = 399.57. Matches.
+2: id2, prod10, qty5, unit_price 314.82, line_total 1495.395. Bronze, qty5 => discount 0.05. 5*314.82 = 1574.10. *0.95 = 1495.395. Matches.
+3: id3, prod15, qty5, unit_price 467.69, line_total 2221.5275. 5*467.69=2338.45*0.95=2221.5275. Matches.
+4: id4, prod50, qty1, unit_price 353.77, line_total 353.77. OK.
+5: id5, prod38, qty1, unit_price 494.18, line_total 494.18. OK.
+6: id6, prod35, qty2, unit_price 404.81, line_total 809.62. OK.
+7: id7, prod34, qty1, unit_price 79.97, line_total 79.97. OK.
+8: id8, prod27, qty4, unit_price 132.86, line_total 531.44. OK.
+9: id9, prod12, qty9, unit_price 90.39, line_total 772.8345. 9*90.39=813.51*0.95=772.8345. OK.
+10: id10, prod41, qty6, unit_price 124.41, line_total 709.137. 6*124.41=746.46*0.95=709.137. OK.
+Sum of line_totals = 399.57+1495.395+2221.5275+353.77+494.18+809.62+79.97+531.44+772.8345+709.137 = let's add:
+399.57+1495.395=1894.965
++2221.5275=4116.4925
++353.77=4470.2625
++494.18=4964.4425
++809.62=5774.0625
++79.97=5854.0325
++531.44=6385.4725
++772.8345=7158.307
++709.137=7867.444.
+Order total = 7867.444 * (1+0.15) = 7867.444 * 1.15 = 9047.5606. Let's compute: 7867.444 * 1.15 = 7867.444 + 1180.1166 = 9047.5606. Yes! Matches order 1 total. Good.
+
+Order 2: customer_id 1 (bronze, OTHER, tax 0.15). Items 11-22.
+11: prod46, qty7, price 415.66, line_total 2764.139. 7*415.66=2909.62*0.95=2764.139. OK.
+12: prod33, qty10, price84.96, line_total790.128. 10*84.96=849.6*0.93? Wait bronze qty10 => discount 0.07. 849.6*(1-0.07)=849.6*0.93=790.128. OK.
+13: prod2, qty8, price478.7, line_total3638.12. 8*478.7=3829.6*0.95=3638.12. OK.
+14: prod3, qty10, price467.36, line_total4346.448. 10*467.36=4673.6*0.93=4346.448. OK.
+15: prod7, qty4, price95.39, line_total381.56. 4*95.39=381.56*1.0=381.56. OK.
+16: prod4, qty2, price415.68, line_total831.36. OK.
+17: prod15, qty4, price387.2, line_total1548.8. OK.
+18: prod17, qty10, price270.16, line_total2512.488. 10*270.16=2701.6*0.93=2512.488. OK.
+19: prod2, qty7, price203.78, line_total1355.137. 7*203.78=1426.46*0.95=1355.137. OK.
+20: prod33, qty10, price77.48, line_total720.564. 10*77.48=774.8*0.93=720.564. OK.
+21: prod29, qty10, price102.6, line_total954.18. 10*102.6=1026*0.93=954.18. OK.
+22: prod30, qty10, price176.75, line_total1643.775. 10*176.75=1767.5*0.93=1643.775. OK.
+Sum line_totals: let's add.
+2764.139+790.128=3554.267
++3638.12=7192.387
++4346.448=11538.835
++381.56=11920.395
++831.36=12751.755
++1548.8=14300.555
++2512.488=16813.043
++1355.137=18168.18
++720.564=18888.744
++954.18=19842.924
++1643.775=21486.699.
+Total with tax 1.15: 21486.699 * 1.15 = 21486.699 + 3223.00485 = 24709.70385. Matches exactly. Good.
+
+So derivation seems correct for first two orders. Let's check a few more to see if any mismatch.
+
+Order 3: customer_id 2 (silver, US, tax 0.08). Items 23-37.
+23: prod10, qty8, price282.95, line_total2037.24. Silver qty8 => discount 0.10. 8*282.95=2263.6*0.9=2037.24. OK.
+24: prod8, qty10, price292.11, line_total2570.568. Silver qty10 => discount 0.12. 10*292.11=2921.1*0.88=2570.568. OK.
+25: prod48, qty3, price242.44, line_total690.954. Silver qty3 => discount 0.05. 3*242.44=727.32*0.95=690.954. OK.
+26: prod31, qty1, price235.89, line_total224.0955. Silver qty1 => discount 0.05. 235.89*0.95=224.0955. OK.
+27: prod20, qty4, price201.28, line_total764.864. Silver qty4 => disc 0.05. 4*201.28=805.12*0.95=764.864. OK.
+28: prod18, qty2, price493.94, line_total938.486. Silver qty2 => disc 0.05. 2*493.94=987.88*0.95=938.486. OK.
+29: prod2, qty1, price259.01, line_total246.0595. Silver qty1 => 0.05. 259.01*0.95=246.0595. OK.
+30: prod37, qty10, price347.04, line_total3053.952. Silver qty10 => 0.12. 10*347.04=3470.4*0.88=3053.952. OK.
+31: prod1, qty1, price354.98, line_total337.231. Silver qty1 => 0.05. 354.98*0.95=337.231. OK.
+32: prod9, qty1, price320.66, line_total304.627. Silver qty1 => 0.05. 320.66*0.95=304.627. OK.
+33: prod4, qty1, price35.77, line_total33.9815. Silver qty1 => 0.05. 35.77*0.95=33.9815. OK.
+34: prod17, qty8, price227.26, line_total1636.272. Silver qty8 => 0.10. 8*227.26=1818.08*0.9=1636.272. OK.
+35: prod36, qty9, price86.21, line_total698.301. Silver qty9 => 0.10. 9*86.21=775.89*0.9=698.301. OK.
+36: prod16, qty10, price497.22, line_total4375.536. Silver qty10 => 0.12. 10*497.22=4972.2*0.88=4375.536. OK.
+37: prod48, qty10, price326.43, line_total2872.584. Silver qty10 => 0.12. 10*326.43=3264.3*0.88=2872.584. OK.
+Sum line_totals: let's add.
+2037.24+2570.568=4607.808
++690.954=5298.762
++224.0955=5522.8575
++764.864=6287.7215
++938.486=7226.2075
++246.0595=7472.267
++3053.952=10526.219
++337.231=10863.45
++304.627=11168.077
++33.9815=11202.0585
++1636.272=12838.3305
++698.301=13536.6315
++4375.536=17912.1675
++2872.584=20784.7515.
+Tax US = 0.08. Total = 20784.7515 * 1.08 = 20784.7515 + 1662.78012 = 22447.53162. Matches exactly. Good.
+
+Order 4: customer_id 3 (bronze, FR, tax 0.20). Items 38-54.
+38: prod24, qty10, price15.99, line_total148.707. Bronze qty10 => 0.07. 10*15.99=159.9*0.93=148.707. OK.
+39: prod13, qty10, price451.89, line_total4202.577. Bronze qty10 => 0.07. 10*451.89=4518.9*0.93=4202.577. OK.
+40: prod15, qty2, price187.74, line_total375.48. Bronze qty2 => 0.00. OK.
+41: prod2, qty4, price289.92, line_total1159.68. Bronze qty4 => 0.00. OK.
+42: prod8, qty7, price120.24, line_total799.596. Bronze qty7 => 0.05. 7*120.24=841.68*0.95=799.596. OK.
+43: prod50, qty3, price56.37, line_total169.11. Bronze qty3 => 0.00. OK.
+44: prod46, qty7, price275.59, line_total1832.6735. Bronze qty7 => 0.05. 7*275.59=1929.13*0.95=1832.6735. OK.
+45: prod33, qty5, price151.93, line_total721.6675. Bronze qty5 => 0.05. 5*151.93=759.65*0.95=721.6675. OK.
+46: prod13, qty3, price368.32, line_total1104.96. Bronze qty3 => 0.00. OK.
+47: prod47, qty3, price250.63, line_total751.89. Bronze qty3 => 0.00. OK.
+48: prod13, qty10, price185.18, line_total1722.174. Bronze qty10 => 0.07. 10*185.18=1851.8*0.93=1722.174. OK.
+49: prod7, qty2, price467.71, line_total935.42. Bronze qty2 => 0.00. OK.
+50: prod13, qty6, price20.75, line_total118.275. Bronze qty6 => 0.05. 6*20.75=124.5*0.95=118.275. OK.
+51: prod42, qty6, price17.41, line_total99.237. Bronze qty6 => 0.05. 6*17.41=104.46*0.95=99.237. OK.
+52: prod3, qty7, price258.3, line_total1717.695. Bronze qty7 => 0.05. 7*258.3=1808.1*0.95=1717.695. OK.
+53: prod24, qty8, price373.44, line_total2838.144. Bronze qty8 => 0.05. 8*373.44=2987.52*0.95=2838.144. OK.
+54: prod39, qty2, price155.66, line_total311.32. Bronze qty2 => 0.00. OK.
+Sum line_totals: let's add.
+148.707+4202.577=4351.284
++375.48=4726.764
++1159.68=5886.444
++799.596=6686.04
++169.11=6855.15
++1832.6735=8687.8235
++721.6675=9409.491
++1104.96=10514.451
++751.89=11266.341
++1722.174=12988.515
++935.42=13923.935
++118.275=14042.21
++99.237=14141.447
++1717.695=15859.142
++2838.144=18697.286
++311.32=19008.606.
+Tax FR = 0.20. Total = 19008.606 * 1.20 = 22810.3272. Matches exactly. Good.
+
+So far so good. The derivation seems carefully computed. Let's check an order with gold tier and JP tax (0.10). For example order 15: customer_id 6 (gold, JP). Items? Order 15 has id 15. Let's find items for order 15. Looking at order_items, order_id 15 appears? Let's scan. The items are ordered by id, and order_id increases. Order 15 items should be around id 200? Let's see. Order 14 items end at id 199? Actually order 14 items: id 186-200. Then order 15 starts at id 201.
+201: order15, prod23, qty5, price248.12, line_total1054.51. Gold qty5 => discount 0.15. 5*248.12=1240.6*0.85=1054.51. OK.
+202: order15, prod5, qty10, price430.23, line_total3441.84. Gold qty10 => 0.20. 10*430.23=4302.3*0.8=3441.84. OK.
+203: order15, prod15, qty9, price113.67, line_total869.5755. Gold qty9 => 0.15. 9*113.67=1023.03*0.85=869.5755. OK.
+204: order15, prod23, qty5, price362.92, line_total1542.41. Gold qty5 => 0.15. 5*362.92=1814.6*0.85=1542.41. OK.
+205: order15, prod31, qty8, price182.53, line_total1241.204. Gold qty8 => 0.15. 8*182.53=1460.24*0.85=1241.204. OK.
+Sum line_totals: 1054.51+3441.84+869.5755+1542.41+1241.204 = let's add:
+1054.51+3441.84=4496.35
++869.5755=5365.9255
++1542.41=6908.3355
++1241.204=8149.5395.
+Tax JP = 0.10. Total = 8149.5395 * 1.10 = 8964.49345. Matches order 15 total. Good.
+
+Let's check order 16: customer_id 6 (gold, JP). Items 206-214.
+206: prod40, qty9, price187.08, line_total1431.162. Gold qty9 => 0.15. 9*187.08=1683.72*0.85=1431.162. OK.
+207: prod3, qty7, price445.01, line_total2647.8095. Gold qty7 => 0.15. 7*445.01=3115.07*0.85=2647.8095. OK.
+208: prod38, qty2, price238.98, line_total430.164. Gold qty2 => 0.10. 2*238.98=477.96*0.9=430.164. OK.
+209: prod24, qty3, price53.28, line_total143.856. Gold qty3 => 0.10. 3*53.28=159.84*0.9=143.856. OK.
+210: prod1, qty8, price168.7, line_total1147.16. Gold qty8 => 0.15. 8*168.7=1349.6*0.85=1147.16. OK.
+211: prod31, qty3, price334.3, line_total902.61. Gold qty3 => 0.10. 3*334.3=1002.9*0.9=902.61. OK.
+212: prod30, qty1, price490.34, line_total441.306. Gold qty1 => 0.10. 490.34*0.9=441.306. OK.
+213: prod18, qty10, price465.28, line_total3722.24. Gold qty10 => 0.20. 10*465.28=4652.8*0.8=3722.24. OK.
+214: prod6, qty3, price25.37, line_total68.499. Gold qty3 => 0.10. 3*25.37=76.11*0.9=68.499. OK.
+Sum: 1431.162+2647.8095=4078.9715
++430.164=4509.1355
++143.856=4652.9915
++1147.16=5800.1515
++902.61=6702.7615
++441.306=7144.0675
++3722.24=10866.3075
++68.499=10934.8065.
+Tax JP 0.10: *1.10 = 12028.28715. Matches order 16 total. Good.
+
+So derivation is very likely correct for all orders. The data seems carefully generated.
+
+Now cardinality: 1-20 items per order. Let's verify counts per order. Since the data is sorted by item id and order_id is monotonic (mostly increasing), we can count the number of rows per order_id.
+
+Let's list order_ids and count items. I'll scan through the order_items and note when order_id changes.
+
+id 1-10: order_id 1 (10 items)
+id 11-22: order_id 2 (12 items)
+id 23-37: order_id 3 (15 items)
+id 38-54: order_id 4 (17 items)
+id 55-72: order_id 5 (18 items)
+id 73-88: order_id 6 (16 items)
+id 89-103: order_id 7 (15 items)
+id 104-113: order_id 8 (10 items)
+id 114-122: order_id 9 (9 items)
+id 123-142: order_id 10 (20 items) -> at limit.
+id 143-156: order_id 11 (14 items)
+id 157-168: order_id 12 (12 items)
+id 169-185: order_id 13 (17 items)
+id 186-200: order_id 14 (15 items)
+id 201-205: order_id 15 (5 items)
+id 206-214: order_id 16 (9 items)
+id 215-219: order_id 17 (5 items)
+id 220-234: order_id 18 (15 items)
+id 235-252: order_id 19 (18 items)
+id 253-269: order_id 20 (17 items)
+id 270-286: order_id 21 (17 items)
+id 287-294: order_id 22 (8 items)
+id 295-302: order_id 23 (8 items)
+id 303-306: order_id 24 (4 items)
+id 307-313: order_id 25 (7 items)
+id 314-321: order_id 26 (8 items)
+id 322-339: order_id 27 (18 items)
+id 340: order_id 28 (1 item) -> id 340 only? Let's check. After 339, id 340 is order 28. Then id 341 starts order 29. So order 28 has 1 item. That's okay (1-20).
+id 341-358: order_id 29 (18 items)
+id 359-363: order_id 30 (5 items)
+id 364: order_id 31 (1 item)
+id 365-368: order_id 32 (4 items)
+id 369-381: order_id 33 (13 items)
+id 382-395: order_id 34 (14 items)
+id 396-403: order_id 35 (8 items)
+id 404-419: order_id 36 (16 items)
+id 420-438: order_id 37 (19 items)
+id 439-452: order_id 38 (14 items)
+id 453-459: order_id 39 (7 items)
+id 460-462: order_id 40 (3 items)
+id 463-471: order_id 41 (9 items)
+id 472-479: order_id 42 (8 items)
+id 480-497: order_id 43 (18 items)
+id 498-512: order_id 44 (15 items)
+id 513-524: order_id 45 (12 items)
+id 525-542: order_id 46 (18 items)
+id 543: order_id 47 (1 item)
+id 544-561: order_id 48 (18 items)
+id 562-566: order_id 49 (5 items)
+id 567-586: order_id 50 (20 items) -> at limit.
+id 587-593: order_id 51 (7 items)
+id 594-606: order_id 52 (13 items)
+id 607-622: order_id 53 (16 items)
+id 623-641: order_id 54 (19 items)
+id 642-645: order_id 55 (4 items)
+id 646-657: order_id 56 (12 items)
+id 658-672: order_id 57 (15 items)
+id 673-692: order_id 58 (20 items) -> at limit.
+id 693-698: order_id 59 (6 items)
+id 699-700: order_id 60 (2 items)
+id 701-712: order_id 61 (12 items)
+id 713-722: order_id 62 (10 items)
+id 723-741: order_id 63 (19 items)
+id 742-747: order_id 64 (6 items)
+id 748-757: order_id 65 (10 items)
+id 758-763: order_id 66 (6 items)
+id 764-766: order_id 67 (3 items)
+id 767-771: order_id 68 (5 items)
+id 772-791: order_id 69 (20 items) -> at limit.
+id 792-795: order_id 70 (4 items)
+id 796-800: order_id 71 (5 items)
+id 801-818: order_id 72 (18 items)
+id 819-836: order_id 73 (18 items)
+id 837-848: order_id 74 (12 items)
+id 849-856: order_id 75 (8 items)
+id 857-873: order_id 76 (17 items)
+id 874: order_id 77 (1 item)
+id 875-877: order_id 78 (3 items)
+id 878-880: order_id 79 (3 items)
+id 881-894: order_id 80 (14 items)
+id 895-907: order_id 81 (13 items)
+id 908-919: order_id 82 (12 items)
+id 920-939: order_id 83 (20 items) -> at limit.
+id 940-946: order_id 84 (7 items)
+id 947-961: order_id 85 (15 items)
+id 962-981: order_id 86 (20 items) -> at limit.
+id 982-996: order_id 87 (15 items)
+id 997-1015: order_id 88 (19 items)
+id 1016-1019: order_id 89 (4 items)
+id 1020-1034: order_id 90 (15 items)
+id 1035-1043: order_id 91 (9 items)
+id 1044-1062: order_id 92 (19 items)
+id 1063-1072: order_id 93 (10 items)
+id 1073-1074: order_id 94 (2 items)
+id 1075-1091: order_id 95 (17 items)
+id 1092-1101: order_id 96 (10 items)
+id 1102-1115: order_id 97 (14 items)
+id 1116-1133: order_id 98 (18 items)
+id 1134-1151: order_id 99 (18 items)
+id 1152-1160: order_id 100 (9 items)
+id 1161-1174: order_id 101 (14 items)
+id 1175-1191: order_id 102 (17 items)
+id 1192-1208: order_id 103 (17 items)
+id 1209-1215: order_id 104 (7 items)
+id 1216: order_id 105 (1 item)
+id 1217-1227: order_id 106 (11 items)
+id 1228-1247: order_id 107 (20 items) -> at limit.
+id 1248-1264: order_id 108 (17 items)
+id 1265-1267: order_id 109 (3 items)
+id 1268-1278: order_id 110 (11 items)
+id 1279-1290: order_id 111 (12 items)
+id 1291-1306: order_id 112 (16 items)
+id 1307-1308: order_id 113 (2 items)
+id 1309-1325: order_id 114 (17 items)
+id 1326-1335: order_id 115 (10 items)
+id 1336-1345: order_id 116 (10 items)
+id 1346-1357: order_id 117 (12 items)
+id 1358-1361: order_id 118 (4 items)
+id 1362-1379: order_id 119 (18 items)
+id 1380-1382: order_id 120 (3 items)
+id 1383-1393: order_id 121 (11 items)
+id 1394-1406: order_id 122 (13 items)
+id 1407-1411: order_id 123 (5 items)
+id 1412-1413: order_id 124 (2 items)
+id 1414-1429: order_id 125 (16 items)
+id 1430-1446: order_id 126 (17 items)
+id 1447-1463: order_id 127 (17 items)
+id 1464-1466: order_id 128 (3 items)
+id 1467-1473: order_id 129 (7 items)
+id 1474-1477: order_id 130 (4 items)
+
+Wait, we have order_items up to id 1477, and the last order_id is 130. But orders go up to 134. So orders 131, 132, 133, 134 have no items? Let's check. The orders.csv has orders 131-134. But in order_items.csv, the highest order_id is 130. So orders 131, 132, 133, 134 have zero line items. That violates the cardinality rule: each order must have between 1 and 20 line items inclusive.
+
+Let's verify: order_items.csv last rows:
+1467,129,20,5,218.18,1036.355
+1468,129,29,4,80.71,322.84
+1469,129,49,10,237.81,2211.633
+1470,129,21,6,196.77,1121.589
+1471,129,26,6,252.47,1439.079
+1472,129,18,9,142.02,1214.271
+1473,129,45,7,83.8,557.27
+1474,130,18,10,261.9,2435.67
+1475,130,30,10,232.33,2160.669
+1476,130,7,8,114.69,871.644
+1477,130,30,9,45.43,388.4265
+
+So indeed order_items only go up to order_id 130. Orders 131-134 have no items. That is a cardinality_break (per-order item count must be 1-20). Also, this means referential integrity is fine (orders exist, but items don't reference missing orders; however orders 131-134 have no items, which is a cardinality violation, not FK). Also, derivation for orders 131-134: their total must be sum(line_total)*tax, but sum over empty set is 0, so total should be 0? But they have non-zero totals. However the cardinality rule already breaks. The question says: "A single violation makes the state ILLEGAL". We need to identify the specific violation. The most obvious is cardinality_break because orders 131-134 have 0 line items.
+
+But wait: are there any orders before 131 that have 0 items? Let's double-check that we didn't miss any items for orders 131-134. The order_items list is sorted by id, and order_id is monotonic but not strictly: it increases and sometimes decreases? Actually looking at the data, order_id generally increases but sometimes stays same, then jumps to next. Let's verify the transition around id 1477. The last item is order 130. There are no items for order 131, 132, 133, 134. So those four orders have zero items.
+
+But is it possible that order_items for these orders are missing because they are at the end and we just don't see them? The CSV ends at id 1477. Orders 131-134 are in orders.csv. So yes, they have no items.
+
+Thus cardinality_break is present.
+
+But we should also check if any order has >20 items. From our scan, the maximum we saw was 20 (orders 10, 50, 58, 69, 83, 86, 107). All exactly 20. So no >20.
+
+Also check per-customer open-order limit: we already did, it's fine.
+
+Status transitions: we checked, fine.
+
+Referential integrity: fine.
+
+Derivation: for orders with no items, the derivation would also be wrong (since total is non-zero but sum of line items is 0). But cardinality is already violated.
+
+The question asks: Reply with a single JSON object. If ILLEGAL, specify violation type. The violation is cardinality_break.
+
+But let's double-check: Are there any orders with 0 items other than 131-134? Let's verify counts for all orders 1-130. We counted each. Let's ensure every order from 1 to 130 has at least 1 item. Our scan showed each had at least 1. For example order 28 had 1, order 31 had 1, order 47 had 1, order 55 had 4, order 60 had 2, order 77 had 1, order 80 had 1, order 89 had 4, order 105 had 1. So yes.
+
+Thus the state is ILLEGAL due to cardinality_break.
+
+Wait, but we need to be careful: The cardinality rule says "each order has 1-20 line items". Does this apply to orders that are cancelled or delivered? The rule doesn't say it only applies to open orders. It says "each order". So yes, all orders must have 1-20 line items. Orders 131-134 have 0.
+
+Let's verify orders 131-134 details:
+131: id 131, customer_id 49, status shipped, prev_status pending, total 33058.82356
+132: id 132, customer_id 49, status shipped, prev_status pending, total 4165.55216
+133: id 133, customer_id 50, status cancelled, prev_status pending, total 8535.27996
+134: id 134, customer_id 50, status shipped, prev_status pending, total 6324.92226
+
+No items for these. So cardinality_break.
+
+But before finalizing, let's check if there is any other hidden violation. For instance, order 130 has items 1474-1477 (4 items). That's fine. Order 129 has items 1467-1473 (7 items). Fine.
+
+What about order 105? id 1216 only. That's 1 item. Fine.
+
+Thus the answer is ILLEGAL cardinality_break.
+
+But wait: The problem says "Default to LEGAL unless you can identify a specific row, value, or pair that violates one of the four rules above." We have identified specific orders (131-134) that violate cardinality. So we should output {"label":"ILLEGAL","violation":"cardinality_break"}.
+
+However, I want to double-check if there is any possibility that orders 131-134 have items but they were omitted from the CSV? The CSV is presented as the contents of the file. We must assume it's complete. So yes.
+
+One more check: Are there any orders with >20 items? Let's verify the counts we identified as 20: order 10 (items 123-142: 20 items), order 50 (items 567-586: 20 items), order 58 (items 673-692: 20 items), order 69 (items 772-791: 20 items), order 83 (items 920-939: 20 items), order 86 (items 962-981: 20 items), order 107 (items 1228-1247: 20 items). Let's verify a couple.
+
+Order 10: items 123 to 142 inclusive: 142-123+1 = 20. Yes.
+Order 50: items 567 to 586 inclusive: 586-567+1 = 20. Yes.
+Order 58: items 673 to 692 inclusive: 692-673+1 = 20. Yes.
+Order 69: items 772 to 791 inclusive: 791-772+1 = 20. Yes.
+Order 83: items 920 to 939 inclusive: 939-920+1 = 20. Yes.
+Order 86: items 962 to 981 inclusive: 981-962+1 = 20. Yes.
+Order 107: items 1228 to 1247 inclusive: 1247-1228+1 = 20. Yes.
+
+All exactly 20. No >20.
+
+Now, check if any customer has >3 open orders. We counted earlier. Let's double-check some customers with many orders.
+Cust 5: orders 8(delivered),9(delivered),10(shipped),11(shipped),12(pending). Open: 10,11,12 = 3. OK.
+Cust 6: orders 13(cancelled),14(cancelled),15(delivered),16(cancelled),17(pending). Open: 17 = 1. OK.
+Cust 8: orders 19(shipped),20(pending),21(shipped). Open: 3. OK.
+Cust 14: orders 35(delivered),36(delivered),37(cancelled),38(delivered),39(pending). Open: 1. OK.
+Cust 18: orders 47(delivered),48(cancelled),49(pending). Open: 1. OK.
+Cust 19: orders 50(delivered),51(shipped),52(pending). Open: 2. OK.
+Cust 22: orders 57(delivered),58(pending),59(pending). Open: 2. OK.
+Cust 30: orders 76(delivered),77(cancelled),78(pending),79(shipped). Open: 2. OK.
+Cust 36: orders 87(delivered),88(delivered),89(delivered),90(pending),91(shipped). Open: 2. OK.
+Cust 39: orders 95(cancelled),96(delivered),97(shipped),98(pending),99(pending). Open: 3. OK.
+Cust 40: orders 100(delivered),101(delivered),102(delivered),103(shipped),104(pending). Open: 2. OK.
+Cust 42: orders 106(cancelled),107(delivered),108(shipped),109(shipped),110(shipped). Open: 3. OK.
+Cust 43: orders 111(delivered),112(delivered),113(delivered),114(shipped),115(pending). Open: 2. OK.
+Cust 46: orders 121(pending),122(pending),123(pending). Open: 3. OK.
+Cust 49: orders 128(delivered),129(delivered),130(pending),131(shipped),132(shipped). Wait, orders 130,131,132 are for customer 49. Let's check:
+Order 130: pending, open.
+Order 131: shipped, open.
+Order 132: shipped, open.
+Plus order 128 delivered, 129 delivered. So open orders for cust 49: 130,131,132 = 3. OK.
+Cust 50: orders 133(cancelled),134(shipped). Open: 1. OK.
+
+So open-order limit is fine.
+
+Now, just to be thorough, let's check if any order has a prev_status/status pair that is illegal. We checked all non-empty prev_status. All are in allowed set. What about orders with empty prev_status but status not pending? Let's check. Orders with empty prev_status: 3(pending), 12(pending), 17(pending), 18(pending), 20(pending), 26(pending), 34(pending), 39(pending), 43(pending), 49(pending), 52(pending), 58(pending), 59(pending), 67(pending), 78(pending), 82(pending), 90(pending), 98(pending), 99(pending), 104(pending), 105(pending), 115(pending), 120(pending), 121(pending), 122(pending), 123(pending), 130(pending). All are pending. So if prev_status is null/empty, status is pending. That's fine.
+
+Wait, are there any orders with empty prev_status and status shipped? No. All empty prev_status are pending. Good.
+
+Thus the only violation is cardinality.
+
+But let's also consider: is there any order with items but the order total derivation is off? We checked several and they matched perfectly. Given the data is likely generated by a script, it's probable all derivations are correct. The only anomaly is the missing items for the last four orders. This could be a truncation issue in the CSV generation. But as an auditor, we must classify based on given data.
+
+Therefore, the state is ILLEGAL due to cardinality_break.
+
+One more nuance: The problem says "each order has 1-20 line items". Does an order with 0 line items violate cardinality? Yes, "between 1 and 20 inclusive". So 0 is out.
+
+Thus final answer: {"label":"ILLEGAL","violation":"cardinality_break"}.
+
+But wait, I should also check if orders 131-134 maybe have items that are not shown because the CSV is truncated? The prompt says "A database state, presented as the contents of three CSV files". We must treat the CSV as the complete state. So yes.
+
+Double-check: Are there any orders with id >130 that have items? No, the last item is order 130. So orders 131-134 have zero items.
+
+Thus answer is ILLEGAL cardinality_break.
+
+I will output exactly the JSON.

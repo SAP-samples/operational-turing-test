@@ -1,0 +1,772 @@
+We need to classify the state as LEGAL or ILLEGAL based on four checks: referential integrity, cardinality, derivation, status transition.
+
+We have three tables: customers (50 rows), orders (156 rows), order_items (1686 rows). Need to verify each check.
+
+First, referential integrity: every orders.customer_id in customers.id; every order_items.order_id in orders.id.
+
+Customers ids: 1 to 50. Orders customer_ids range 1 to 50? Let's check orders.csv. The customer_id column: 1,2,2,3,3,3,3,4,4,4,5,5,5,6,6,6,6,6,7,7,8,8,8,8,9,9,9,9,10,10,10,11,11,11,11,12,12,13,13,13,14,15,15,16,16,16,17,17,17,17,18,18,18,18,18,19,19,19,20,20,20,20,20,21,21,21,22,22,22,22,23,24,24,24,24,25,25,25,25,25,26,26,26,26,26,27,27,27,28,28,29,29,29,29,30,30,31,31,31,31,32,32,32,33,33,34,34,34,35,35,35,35,36,36,36,36,36,37,37,37,37,37,38,38,38,38,38,39,39,39,40,40,40,40,40,41,42,43,43,43,44,44,44,44,44,44,44,44,44,44,44,45,46,46,46,46,46,46,46,47,47,47,47,47,48,48,48,48,48,48,48,48,48,48,48,48,48,49,49,49,50,50,50,50,50,50,50,50,50.
+
+All between 1 and 50. So referential integrity for customers holds.
+
+Order_items.order_id: need to check all order_ids exist in orders.id (1..156). Let's scan order_items.csv: order_id values go from 1 up to 156? The last rows: 156. Let's check max order_id: 156. Min: 1. Are there any missing? Probably all present. But we need to be careful: order_items has 1686 rows. We need to ensure every order_id in 1..156? Not necessarily; some orders might have no items? But cardinality rule says each order must have 1-20 line items. So every order in orders must have at least 1 item. Also every item must reference an existing order. We need to check if any order_id in items is >156 or not in orders set. The orders ids are 1 to 156 (seemingly). Let's verify: orders.csv has ids 1..156. Yes. So FK for order_items likely holds. But we also need to check that every order has at least 1 item and at most 20 items. We'll check cardinality next.
+
+Cardinalities:
+- Per-order item count: each order must have between 1 and 20 line items inclusive.
+- Per-customer open-order limit: at most 3 open orders per customer, where open = status in {pending, shipped}.
+
+We need to compute item counts per order and open order counts per customer.
+
+Given the large data, we need to systematically check. Since we cannot run code, we need to reason or simulate. But perhaps there is a violation that is obvious. Let's check status transitions first, as it's easy to scan.
+
+Status transition rule: allowed pairs (prev_status, status):
+- (pending, shipped)
+- (shipped, delivered)
+- (pending, cancelled)
+- (pending, pending) -- initial state
+
+So prev_status must be either 'pending' or 'shipped' (or empty? Actually initial state prev_status is empty? In orders.csv, some prev_status are empty. Let's see: order 3 has prev_status empty and status pending. Is that allowed? The trigger checks ARRAY[NEW.prev_status, NEW.status] = ANY(allowed). The allowed array contains ['pending','pending'] but not [NULL,'pending'] or ['','pending']. However, in the CSV, prev_status is empty string for some rows. Does the trigger treat empty string as a value? In PostgreSQL, if prev_status is NULL, then ARRAY[NULL, 'pending'] would not equal any text array. But in the CSV, it's shown as empty. The DDL says prev_status VARCHAR(20), no NOT NULL. So it could be NULL or empty string. The trigger uses ARRAY[NEW.prev_status, NEW.status] = ANY(allowed). If prev_status is NULL, the array would be [NULL, 'pending'], which is not equal to any of the allowed text arrays, so it would raise exception. However, the application might insert initial orders with prev_status = NULL? But the allowed set includes (pending,pending) as initial state. That suggests initial state should have prev_status = 'pending' and status = 'pending'? Wait, the comment says "-- initial state" for ['pending','pending']. That means when an order is first inserted, prev_status = 'pending' and status = 'pending'? Or maybe prev_status is set to 'pending' for the initial state. But in the data, we see many orders with prev_status empty and status pending. For example, order 3: customer_id 2, status pending, prev_status empty. Order 30: pending, prev_status empty. Order 33: pending, prev_status empty. Order 45: pending, prev_status empty. Order 62: pending, prev_status empty. Order 73: pending, prev_status empty. Order 74: pending, prev_status empty. Order 88: pending, prev_status empty. Order 93: pending, prev_status empty. Order 94: pending, prev_status empty. Order 100: pending, prev_status empty. Order 118: pending, prev_status empty. Order 128: pending, prev_status empty. Order 136: pending, prev_status empty. Order 141: pending, prev_status empty. Order 145: pending, prev_status empty. Order 148: pending, prev_status empty. Order 150: pending, prev_status empty. Order 153: pending, prev_status empty.
+
+Wait, but the trigger would reject these if prev_status is NULL or empty string, because allowed does not include ['', 'pending'] or [NULL, 'pending']. However, maybe the trigger is not active? Or maybe the empty string in CSV represents NULL? In PostgreSQL COPY, NULL is represented as empty string by default? Actually in CSV, NULL is often represented as empty string. So prev_status is NULL. The trigger would reject. But perhaps the data is generated with the trigger disabled, or the initial state is meant to be prev_status = NULL? But the trigger code explicitly only allows the four pairs. So any order with prev_status NULL and status pending would be illegal unless the trigger treats NULL differently. In PL/pgSQL, ARRAY[NULL, 'pending'] = ANY(ARRAY[['pending','shipped'],...]) yields NULL, not TRUE. The IF NOT (...) then RAISE. Since NULL is not TRUE, the condition NOT NULL is NULL, which in an IF statement is treated as FALSE? Wait, in PL/pgSQL, an IF condition that evaluates to NULL is treated as FALSE? Actually in PostgreSQL PL/pgSQL, the IF statement evaluates the boolean expression. If the result is NULL, it is treated as FALSE. Let's recall: In SQL, boolean NULL is unknown. In PL/pgSQL control structures, a NULL boolean is treated as FALSE. Let me verify: PostgreSQL documentation says: "If the expression yields true, then the statements are executed. If it yields false or null, they are not executed." So IF NOT (NULL) would be IF NOT NULL -> NULL, treated as FALSE, so it would NOT raise. Wait, let's think: The expression inside IF is `NOT (ARRAY[NEW.prev_status, NEW.status] = ANY (allowed))`. If prev_status is NULL, then ARRAY[NULL, 'pending'] = ANY(...) returns NULL (since comparison with NULL yields NULL). Then NOT NULL is NULL. In PL/pgSQL, IF NULL THEN ... END IF; does not execute the THEN branch. So the RAISE would NOT be executed. That means NULL prev_status bypasses the check! So initial state could be prev_status NULL, status pending. That is likely the case. So empty prev_status means NULL, which is allowed as an initial state because the trigger doesn't catch it. But is that intended? The problem statement says: "Status transition: the pair (prev_status, status) of every order lies in the allowed set {(pending, shipped), (shipped, delivered), (pending, cancelled), (pending, pending)}." It does not mention NULL. However, many rows have empty prev_status. If we interpret empty as NULL, then the pair (NULL, pending) is not in the allowed set. But the trigger as written would not reject it due to NULL handling. The question asks to classify based on the rules given, not necessarily on the trigger's bug. The natural-language description says: "Status transition: the pair (prev_status, status) of every order lies in the allowed set ...". It doesn't mention NULL. So if prev_status is NULL, it's not in the set, so it's a violation? But the trigger is provided as the procedural rule. The problem says "A state is LEGAL iff every one of the following holds." One of them is "Status transition: the pair (prev_status, status) of every order lies in the allowed set ...". So we must check that exact set. If prev_status is empty/NULL, then it's not in the set. However, maybe the empty string is considered as 'pending'? No, that would be weird. Let's examine the data: some orders have prev_status empty and status pending. Some have prev_status empty and status delivered? Let's check: order 37: prev_status empty, status delivered. That would be (NULL, delivered) which is definitely not allowed. Order 37 is customer 12, status delivered, prev_status empty. That seems like a violation. But maybe the empty string is just a CSV representation of NULL, and the allowed set should include (NULL, pending) as initial? But the problem statement explicitly lists the allowed set and does not include NULL. However, the trigger comment says "-- initial state" for (pending,pending). That suggests initial state is prev_status='pending', status='pending'. But in the data, many initial orders have prev_status empty. Could it be that the empty string is actually the string 'pending' but omitted? No.
+
+Wait, maybe I misread the CSV. Let's look at orders.csv more carefully. The columns are: id,customer_id,status,prev_status,order_date,total. For order 1: shipped,pending. Order 2: shipped,pending. Order 3: pending,,... So prev_status is empty. Order 4: delivered,shipped. Order 5: delivered,shipped. Order 6: delivered,shipped. Order 7: cancelled,pending. Order 8: cancelled,pending. Order 9: delivered,shipped. Order 10: delivered,shipped. Order 11: delivered,shipped. Order 12: cancelled,pending. Order 13: shipped,pending. Order 14: delivered,shipped. Order 15: delivered,shipped. Order 16: delivered,shipped. Order 17: cancelled,pending. Order 18: shipped,pending. Order 19: delivered,shipped. Order 20: delivered,shipped. Order 21: delivered,shipped. Order 22: delivered,shipped. Order 23: delivered,shipped. Order 24: shipped,pending. Order 25: delivered,shipped. Order 26: cancelled,pending. Order 27: shipped,pending. Order 28: shipped,pending. Order 29: shipped,pending. Order 30: pending,,... etc.
+
+So many orders have empty prev_status. If empty means NULL, then status transition rule is violated for all of them because (NULL, pending) is not in allowed set. But maybe the empty string is a representation of 'pending'? No, because some have prev_status 'pending' explicitly (e.g., order 1 has prev_status 'pending'). So empty is distinct from 'pending'.
+
+Alternatively, maybe the empty prev_status indicates that the order was inserted before the trigger existed, or the trigger allows NULL as a valid "no previous status" for the very first state. But the natural-language rule says the pair must lie in the allowed set. It doesn't say "or NULL". So strictly by the natural-language rule, any order with prev_status not in {pending, shipped} is a violation. But wait, the allowed set includes (pending,pending). If an order is newly created, its prev_status could be set to 'pending' and status 'pending'. But the data shows empty. This suggests the data might be ILLEGAL due to transition_break. However, we need to check if there are other violations. But before concluding, let's consider the possibility that the empty string is actually NULL and the trigger function as written in PL/pgSQL would allow it (since NULL = ANY returns NULL, NOT NULL is NULL, IF NULL is false). The problem says "Status transition: the pair (prev_status, status) of every order lies in the allowed set ...". This is a direct statement. It doesn't say "or NULL". So we should treat empty/NULL as not in the set. But is there any order with prev_status empty and status not pending? Yes, order 37: prev_status empty, status delivered. That's definitely a violation. Also order 99: pending,shipped? Wait order 99: status pending, prev_status shipped? Let's check: order 99 is id 99, customer_id 31, status pending, prev_status shipped. That pair is (shipped, pending). Is that allowed? No. Allowed are only (pending,shipped), (shipped,delivered), (pending,cancelled), (pending,pending). So (shipped,pending) is illegal. Let's verify: in orders.csv, line 99: 99,31,pending,shipped,2022-03-07,1028.54556. Yes! That's a clear violation: prev_status='shipped', status='pending'. Not allowed.
+
+Also order 100: 100,31,pending,,... (NULL,pending) if empty is NULL. But order 99 is definitely a violation regardless of NULL interpretation.
+
+So there is at least one status transition violation: order 99 (shipped->pending). Also possibly many others. So the state is ILLEGAL with violation transition_break.
+
+But we need to be careful: the question says "A state is LEGAL iff every one of the following holds. A single violation makes the state ILLEGAL". So if we find any violation, we output that. We need to choose the correct violation type. If multiple, we can pick any? The JSON format says "violation": "X" where X is one of the four. It doesn't specify which one if multiple. But presumably we should pick the first one we find, or any valid one. However, maybe the data is designed to have exactly one violation type. Let's check if order 99 is indeed a violation. Yes. Are there others? Let's scan for other illegal transitions.
+
+We need to check all orders where prev_status is not empty. Let's list them:
+
+Order 1: pending -> shipped (allowed)
+2: pending -> shipped (allowed)
+3: empty -> pending (if empty not allowed, violation; but maybe initial)
+4: shipped -> delivered (allowed)
+5: shipped -> delivered (allowed)
+6: shipped -> delivered (allowed)
+7: pending -> cancelled (allowed)
+8: pending -> cancelled (allowed)
+9: shipped -> delivered (allowed)
+10: shipped -> delivered (allowed)
+11: shipped -> delivered (allowed)
+12: pending -> cancelled (allowed)
+13: pending -> shipped (allowed)
+14: shipped -> delivered (allowed)
+15: shipped -> delivered (allowed)
+16: shipped -> delivered (allowed)
+17: pending -> cancelled (allowed)
+18: pending -> shipped (allowed)
+19: shipped -> delivered (allowed)
+20: shipped -> delivered (allowed)
+21: shipped -> delivered (allowed)
+22: shipped -> delivered (allowed)
+23: shipped -> delivered (allowed)
+24: pending -> shipped (allowed)
+25: shipped -> delivered (allowed)
+26: pending -> cancelled (allowed)
+27: pending -> shipped (allowed)
+28: pending -> shipped (allowed)
+29: pending -> shipped (allowed)
+30: empty -> pending
+31: pending -> shipped (allowed)
+32: shipped -> delivered (allowed)
+33: empty -> pending
+34: pending -> shipped (allowed)
+35: pending -> shipped (allowed)
+36: pending -> shipped (allowed)
+37: empty -> delivered (definitely not allowed if empty is not a valid prev_status)
+38: shipped -> delivered (allowed)
+39: pending -> cancelled (allowed)
+40: pending -> shipped (allowed)
+41: shipped -> delivered (allowed)
+42: shipped -> delivered (allowed)
+43: pending -> cancelled (allowed)
+44: pending -> cancelled (allowed)
+45: empty -> pending
+46: pending -> shipped (allowed)
+47: shipped -> delivered (allowed)
+48: pending -> cancelled (allowed)
+49: shipped -> delivered (allowed)
+50: shipped -> delivered (allowed)
+51: shipped -> delivered (allowed)
+52: shipped -> delivered (allowed)
+53: pending -> cancelled (allowed)
+54: pending -> cancelled (allowed)
+55: shipped -> delivered (allowed)
+56: shipped -> delivered (allowed)
+57: pending -> cancelled (allowed)
+58: pending -> cancelled (allowed)
+59: shipped -> delivered (allowed)
+60: pending -> cancelled (allowed)
+61: pending -> cancelled (allowed)
+62: empty -> pending
+63: pending -> shipped (allowed)
+64: pending -> cancelled (allowed)
+65: shipped -> delivered (allowed)
+66: pending -> shipped (allowed)
+67: shipped -> delivered (allowed)
+68: pending -> cancelled (allowed)
+69: shipped -> delivered (allowed)
+70: shipped -> delivered (allowed)
+71: pending -> shipped (allowed)
+72: pending -> cancelled (allowed)
+73: empty -> pending
+74: empty -> pending
+75: pending -> shipped (allowed)
+76: shipped -> delivered (allowed)
+77: pending -> cancelled (allowed)
+78: pending -> shipped (allowed)
+79: pending -> shipped (allowed)
+80: pending -> shipped (allowed)
+81: pending -> cancelled (allowed)
+82: pending -> cancelled (allowed)
+83: shipped -> delivered (allowed)
+84: pending -> cancelled (allowed)
+85: pending -> cancelled (allowed)
+86: shipped -> delivered (allowed)
+87: shipped -> delivered (allowed)
+88: empty -> pending
+89: pending -> cancelled (allowed)
+90: pending -> cancelled (allowed)
+91: shipped -> delivered (allowed)
+92: shipped -> delivered (allowed)
+93: empty -> pending
+94: empty -> pending
+95: shipped -> delivered (allowed)
+96: pending -> cancelled (allowed)
+97: shipped -> delivered (allowed)
+98: shipped -> delivered (allowed)
+99: shipped -> pending (NOT ALLOWED)
+100: empty -> pending
+101: pending -> shipped (allowed)
+102: shipped -> delivered (allowed)
+103: pending -> cancelled (allowed)
+104: shipped -> delivered (allowed)
+105: shipped -> delivered (allowed)
+106: shipped -> delivered (allowed)
+107: shipped -> delivered (allowed)
+108: shipped -> delivered (allowed)
+109: shipped -> delivered (allowed)
+110: pending -> cancelled (allowed)
+111: shipped -> delivered (allowed)
+112: shipped -> delivered (allowed)
+113: shipped -> delivered (allowed)
+114: pending -> cancelled (allowed)
+115: shipped -> delivered (allowed)
+116: shipped -> delivered (allowed)
+117: pending -> shipped (allowed)
+118: empty -> pending
+119: shipped -> delivered (allowed)
+120: shipped -> delivered (allowed)
+121: shipped -> delivered (allowed)
+122: pending -> shipped (allowed)
+123: pending -> shipped (allowed)
+124: shipped -> delivered (allowed)
+125: shipped -> delivered (allowed)
+126: pending -> cancelled (allowed)
+127: shipped -> delivered (allowed)
+128: empty -> pending
+129: pending -> cancelled (allowed)
+130: shipped -> delivered (allowed)
+131: pending -> shipped (allowed)
+132: pending -> cancelled (allowed)
+133: pending -> cancelled (allowed)
+134: pending -> cancelled (allowed)
+135: shipped -> delivered (allowed)
+136: empty -> pending
+137: pending -> shipped (allowed)
+138: shipped -> delivered (allowed)
+139: pending -> cancelled (allowed)
+140: pending -> shipped (allowed)
+141: empty -> pending
+142: shipped -> delivered (allowed)
+143: pending -> shipped (allowed)
+144: pending -> shipped (allowed)
+145: empty -> pending
+146: shipped -> delivered (allowed)
+147: pending -> cancelled (allowed)
+148: empty -> pending
+149: pending -> shipped (allowed)
+150: empty -> pending
+151: shipped -> delivered (allowed)
+152: pending -> cancelled (allowed)
+153: empty -> pending
+154: pending -> shipped (allowed)
+155: pending -> shipped (allowed)
+156: pending -> shipped (allowed)
+
+So there are many empty prev_status rows. If empty is considered a violation, then transition_break is definitely violated. But even if empty is allowed as a special initial state (maybe prev_status NULL means no previous status), order 99 is (shipped,pending) which is not allowed. Also order 37 is (empty,delivered) which would be weird: from nothing to delivered? That seems like a violation. But the most unambiguous violation is order 99: shipped->pending.
+
+Also, what about order 37: empty->delivered. If empty means NULL, and NULL is allowed only with pending? The trigger doesn't check it. But the natural language rule says the pair must be in the allowed set. So (NULL, delivered) is not. So that's also a violation.
+
+Thus transition_break is present.
+
+But we need to be thorough: could there be a derivation or cardinality violation that is the "intended" answer? The problem might be designed such that only one type of violation exists. Let's check if there are any cardinality violations (per-order item count >20 or =0, or per-customer open orders >3). We need to check if any order has >20 items or 0 items. Also check if any customer has >3 open orders.
+
+Given the large number of items, it's plausible that some order has >20 items. Let's check. We can count items per order by scanning order_items.csv. Since there are 1686 items and 156 orders, average is about 10.8 items per order. Some orders might have many items. Let's see the distribution. We can try to identify orders with many items by looking at consecutive item IDs. But it's hard manually. However, we can look for orders that appear many times. For example, order 41 appears in items: 382-400? Let's check. Items 382-400 are order 41. That's 19 items (382 to 400 inclusive is 19). So order 41 has 19 items, which is within 1-20.
+
+Order 44: items 416-426? Let's see: 416,417,418,419,420,421,422,423,424,425,426. That's 11 items.
+
+Order 48: items 444-462? That's 19 items (444 to 462 inclusive). Within limit.
+
+Order 50: items 466-474? That's 9 items.
+
+Order 51: items 475-483? That's 9 items.
+
+Order 52: items 484-490? That's 7 items.
+
+Order 53: items 491-497? That's 7 items.
+
+Order 54: items 498-517? That's 20 items (498 to 517 inclusive). Exactly 20. OK.
+
+Order 55: items 518-535? That's 18 items.
+
+Order 56: items 536-541? That's 6 items.
+
+Order 57: items 542-557? That's 16 items.
+
+Order 58: items 558-562? That's 5 items.
+
+Order 59: items 563-576? That's 14 items.
+
+Order 60: items 577-586? That's 10 items.
+
+Order 61: items 587-598? That's 12 items.
+
+Order 62: items 599-611? That's 13 items.
+
+Order 63: items 612-630? That's 19 items.
+
+Order 64: items 631-636? That's 6 items.
+
+Order 65: items 637-653? That's 17 items.
+
+Order 66: items 654-670? That's 17 items.
+
+Order 67: items 671-690? That's 20 items (671-690 inclusive). Exactly 20.
+
+Order 68: items 691-705? That's 15 items.
+
+Order 69: items 706-716? That's 11 items.
+
+Order 70: items 717-730? That's 14 items.
+
+Order 71: items 731-746? That's 16 items.
+
+Order 72: items 747-751? That's 5 items.
+
+Order 73: items 752-754? That's 3 items.
+
+Order 74: items 755-760? That's 6 items.
+
+Order 75: items 761-780? That's 20 items (761-780 inclusive). Exactly 20.
+
+Order 76: items 781-787? That's 7 items.
+
+Order 77: items 788-797? That's 10 items.
+
+Order 78: items 798-811? That's 14 items.
+
+Order 79: items 812-823? That's 12 items.
+
+Order 80: items 824-834? That's 11 items.
+
+Order 81: items 835-851? That's 17 items.
+
+Order 82: items 852-853? That's 2 items.
+
+Order 83: items 854-857? That's 4 items.
+
+Order 84: items 858-873? That's 16 items.
+
+Order 85: items 874-879? That's 6 items.
+
+Order 86: items 880-885? That's 6 items.
+
+Order 87: items 886-890? That's 5 items.
+
+Order 88: items 891-907? That's 17 items.
+
+Order 89: items 908-924? That's 17 items.
+
+Order 90: items 925-944? That's 20 items (925-944 inclusive). Exactly 20.
+
+Order 91: items 945-961? That's 17 items.
+
+Order 92: items 962-981? That's 20 items (962-981 inclusive). Exactly 20.
+
+Order 93: items 982-986? That's 5 items.
+
+Order 94: items 987-1002? That's 16 items.
+
+Order 95: item 1003 only? 1 item.
+
+Order 96: items 1004-1013? That's 10 items.
+
+Order 97: items 1014-1028? That's 15 items.
+
+Order 98: items 1029-1030? That's 2 items.
+
+Order 99: items 1031 only? 1 item.
+
+Order 100: items 1032-1041? That's 10 items.
+
+Order 101: items 1042-1057? That's 16 items.
+
+Order 102: items 1058-1066? That's 9 items.
+
+Order 103: items 1067-1082? That's 16 items.
+
+Order 104: items 1083-1087? That's 5 items.
+
+Order 105: items 1088-1099? That's 12 items.
+
+Order 106: items 1100-1102? That's 3 items.
+
+Order 107: items 1103-1115? That's 13 items.
+
+Order 108: items 1116-1134? That's 19 items.
+
+Order 109: items 1135-1143? That's 9 items.
+
+Order 110: items 1144-1157? That's 14 items.
+
+Order 111: items 1158-1177? That's 20 items (1158-1177 inclusive). Exactly 20.
+
+Order 112: items 1178-1193? That's 16 items.
+
+Order 113: items 1194-1201? That's 8 items.
+
+Order 114: items 1202-1209? That's 8 items.
+
+Order 115: items 1210-1226? That's 17 items.
+
+Order 116: items 1227-1242? That's 16 items.
+
+Order 117: items 1243-1244? That's 2 items.
+
+Order 118: items 1245-1262? That's 18 items.
+
+Order 119: items 1263-1279? That's 17 items.
+
+Order 120: items 1280-1289? That's 10 items.
+
+Order 121: items 1290-1307? That's 18 items.
+
+Order 122: items 1308-1320? That's 13 items.
+
+Order 123: items 1321-1330? That's 10 items.
+
+Order 124: items 1331-1340? That's 10 items.
+
+Order 125: item 1341 only? 1 item.
+
+Order 126: items 1342-1359? That's 18 items.
+
+Order 127: items 1360-1363? That's 4 items.
+
+Order 128: items 1364-1378? That's 15 items.
+
+Order 129: items 1379-1397? That's 19 items.
+
+Order 130: item 1398 only? 1 item.
+
+Order 131: items 1399-1408? That's 10 items.
+
+Order 132: items 1409-1421? That's 13 items.
+
+Order 133: items 1422-1439? That's 18 items.
+
+Order 134: items 1441-1448? That's 8 items. Wait, item 1440 is missing? Let's check: after 1439, next is 1441. So maybe item 1440 is omitted? Actually order 134 items: 1441,1442,1443,1444,1445,1446,1447,1448. That's 8 items. OK.
+
+Order 135: items 1449-1450? That's 2 items.
+
+Order 136: items 1451-1459? That's 9 items.
+
+Order 137: items 1460-1472? That's 13 items.
+
+Order 138: items 1473-1483? That's 11 items.
+
+Order 139: items 1484-1497? That's 14 items.
+
+Order 140: items 1498-1509? That's 12 items.
+
+Order 141: items 1510-1516? That's 7 items.
+
+Order 142: items 1517-1523? That's 7 items.
+
+Order 143: items 1524-1526? That's 3 items.
+
+Order 144: items 1527-1544? That's 18 items.
+
+Order 145: items 1545-1563? That's 19 items.
+
+Order 146: items 1564-1581? That's 18 items.
+
+Order 147: items 1582-1590? That's 9 items.
+
+Order 148: item 1591 only? 1 item.
+
+Order 149: items 1592-1605? That's 14 items.
+
+Order 150: items 1606-1622? That's 17 items.
+
+Order 151: items 1623-1627? That's 5 items.
+
+Order 152: items 1628-1632? That's 5 items.
+
+Order 153: items 1633-1634? That's 2 items.
+
+Order 154: items 1635-1653? That's 19 items.
+
+Order 155: items 1654-1673? That's 20 items (1654-1673 inclusive). Exactly 20.
+
+Order 156: items 1674-1686? That's 13 items.
+
+So all orders have between 1 and 20 items. No cardinality_break on per-order item count.
+
+Now per-customer open-order limit: at most 3 open orders per customer, where open = status in {pending, shipped}.
+
+We need to count open orders per customer. Let's tally from orders.csv.
+
+I'll go through orders by customer_id.
+
+Customer 1: order 1 (shipped), order? Only order 1. Open: 1 (shipped). OK.
+
+Customer 2: orders 2 (shipped), 3 (pending). Open: 2. OK.
+
+Customer 3: orders 4 (delivered),5(delivered),6(delivered),7(cancelled). Open: 0. OK.
+
+Customer 4: orders 8(cancelled),9(delivered),10(delivered). Open:0. OK.
+
+Customer 5: orders 11(delivered),12(cancelled),13(shipped). Open:1. OK.
+
+Customer 6: orders 14(delivered),15(delivered),16(delivered),17(cancelled),18(shipped). Open:1. OK.
+
+Customer 7: orders 19(delivered),20(delivered). Open:0. OK.
+
+Customer 8: orders 21(delivered),22(delivered),23(delivered),24(shipped). Open:1. OK.
+
+Customer 9: orders 25(delivered),26(cancelled),27(shipped),28(shipped). Open:2. OK.
+
+Customer 10: orders 29(shipped),30(pending),31(shipped). Open:3. OK (max 3).
+
+Customer 11: orders 32(delivered),33(pending),34(shipped),35(shipped). Open:3. OK.
+
+Customer 12: orders 36(shipped),37(delivered). Wait, order 37 status delivered, prev_status empty. Open:1 (shipped). OK.
+
+Customer 13: orders 38(delivered),39(cancelled),40(shipped). Open:1. OK.
+
+Customer 14: order 41(delivered). Open:0. OK.
+
+Customer 15: orders 42(delivered),43(cancelled). Open:0. OK.
+
+Customer 16: orders 44(cancelled),45(pending),46(shipped). Open:2. OK.
+
+Customer 17: orders 47(delivered),48(cancelled),49(delivered),50(delivered). Open:0. OK.
+
+Customer 18: orders 51(delivered),52(delivered),53(cancelled),54(cancelled),55(delivered). Open:0. OK.
+
+Customer 19: orders 56(delivered),57(cancelled),58(cancelled). Open:0. OK.
+
+Customer 20: orders 59(delivered),60(cancelled),61(cancelled),62(pending),63(shipped). Open:2. OK.
+
+Customer 21: orders 64(cancelled),65(delivered),66(shipped). Open:1. OK.
+
+Customer 22: orders 67(delivered),68(cancelled),69(delivered),70(delivered). Open:0. OK.
+
+Customer 23: order 71(shipped). Open:1. OK.
+
+Customer 24: orders 72(cancelled),73(pending),74(pending),75(shipped). Open:3. OK.
+
+Customer 25: orders 76(delivered),77(cancelled),78(shipped),79(shipped),80(shipped). Open:3. OK.
+
+Customer 26: orders 81(cancelled),82(cancelled),83(delivered),84(cancelled),85(cancelled). Open:0. OK.
+
+Customer 27: orders 86(delivered),87(delivered),88(pending). Open:1. OK.
+
+Customer 28: orders 89(cancelled),90(cancelled). Open:0. OK.
+
+Customer 29: orders 91(delivered),92(delivered),93(pending),94(pending). Open:2. OK.
+
+Customer 30: orders 95(delivered),96(cancelled). Open:0. OK.
+
+Customer 31: orders 97(delivered),98(delivered),99(pending),100(pending),101(shipped). Open:3 (pending, pending, shipped). Wait, 99 pending, 100 pending, 101 shipped. That's 3 open. OK.
+
+Customer 32: orders 102(delivered),103(cancelled),104(delivered). Open:0. OK.
+
+Customer 33: orders 105(delivered),106(delivered). Open:0. OK.
+
+Customer 34: orders 107(delivered),108(delivered),109(delivered). Open:0. OK.
+
+Customer 35: orders 110(cancelled),111(delivered),112(delivered),113(delivered). Open:0. OK.
+
+Customer 36: orders 114(cancelled),115(delivered),116(delivered),117(shipped),118(pending). Open:2. OK.
+
+Customer 37: orders 119(delivered),120(delivered),121(delivered),122(shipped),123(shipped). Open:2. OK.
+
+Customer 38: orders 124(delivered),125(delivered),126(cancelled),127(delivered),128(pending). Open:1. OK.
+
+Customer 39: orders 129(cancelled),130(delivered),131(shipped). Open:1. OK.
+
+Customer 40: orders 132(cancelled),133(cancelled),134(cancelled),135(delivered),136(pending). Open:1. OK.
+
+Customer 41: order 137(shipped). Open:1. OK.
+
+Customer 42: order 138(delivered). Open:0. OK.
+
+Customer 43: orders 139(cancelled),140(shipped),141(pending). Open:2. OK.
+
+Customer 44: orders 142(delivered). Open:0. OK.
+
+Customer 45: orders 143(shipped),144(shipped). Open:2. OK.
+
+Customer 46: order 145(pending). Open:1. OK.
+
+Customer 47: orders 146(delivered),147(cancelled),148(pending),149(shipped),150(pending). Open:3 (148 pending, 149 shipped, 150 pending). That's 3. OK.
+
+Customer 48: order 151(delivered). Open:0. OK.
+
+Customer 49: orders 152(cancelled),153(pending). Open:1. OK.
+
+Customer 50: orders 154(shipped),155(shipped),156(shipped). Open:3. OK.
+
+So no customer has >3 open orders. Cardinality on open orders is fine.
+
+Now derivation: line_total and order.total must match formulas.
+
+Given the complexity, we need to check if any line_total or order.total is incorrect. The data might have been generated correctly, but maybe there is a subtle error. However, since we already found a transition violation (order 99: shipped->pending), the state is ILLEGAL. But we need to make sure that the transition rule is indeed violated according to the problem statement.
+
+The problem says: "Status transition: the pair (prev_status, status) of every order lies in the allowed set {(pending, shipped), (shipped, delivered), (pending, cancelled), (pending, pending)}."
+
+Order 99 has prev_status = shipped, status = pending. That pair is (shipped, pending). Not in the set. So it's a violation.
+
+Also, many orders have prev_status empty. If empty is considered NULL, then (NULL, pending) is not in the set. But the problem might consider empty as a valid representation of no previous status, but the rule explicitly lists allowed pairs. However, order 37 has prev_status empty, status delivered. That is also not in the set. So definitely transition_break.
+
+But is there any chance that the empty prev_status is actually the string 'pending' but omitted due to CSV formatting? No, because other rows have 'pending' explicitly. So empty is a distinct value.
+
+Wait, could the empty prev_status be interpreted as 'pending' because of some default? The DDL does not have a default. The trigger function comment says "-- initial state" for ['pending','pending']. That suggests that initial state should be prev_status='pending', status='pending'. But the data shows empty for initial state. This might be a bug in the data generation, making it illegal.
+
+But the question is: do we classify based on the natural language rules or the trigger code? The natural language rule says the pair must be in the allowed set. So empty prev_status is not allowed. However, the trigger code as written would allow NULL prev_status because of NULL handling. But the problem statement includes the trigger code for information, but the classification criteria are the four bullet points. The bullet says: "Status transition: the pair (prev_status, status) of every order lies in the allowed set ...". It does not mention NULL. So empty/NULL is a violation.
+
+But if empty is a violation, then almost every order with empty prev_status is a violation. That seems like a massive violation. But maybe the empty string is just how NULL is represented in the CSV, and the intended allowed set includes (NULL, pending) as initial? But the natural language didn't say that. However, the trigger code is provided to show the procedural rule. The trigger explicitly defines allowed as four pairs. It does not include NULL. But due to SQL semantics, NULL bypasses it. The problem says "A PL/pgSQL trigger function that enforces the legal status-transition set." and then later says "Status transition: the pair (prev_status, status) of every order lies in the allowed set ...". This is ambiguous.
+
+But the presence of order 99 (shipped,pending) is unambiguously a violation regardless of NULL semantics. So we can safely output transition_break.
+
+We should also check if there are any derivation violations. Given the large data, it's unlikely we can compute all exactly manually. But maybe there is an obvious one. Let's check a few random ones to see if the formula holds.
+
+Discount table:
+tier: bronze, silver, gold.
+qty [1,4]: bronze 0.00, silver 0.05, gold 0.10.
+qty [5,9]: bronze 0.05, silver 0.10, gold 0.15.
+qty [10,19]: bronze 0.07, silver 0.12, gold 0.20.
+
+Tax:
+DE: 0.19
+FR: 0.20
+GB: 0.20
+JP: 0.10
+US: 0.08
+OTHER: 0.15
+
+Line total = qty * unit_price * (1 - discount).
+Order total = sum(line_total) * (1 + tax).
+
+Let's verify order 1:
+Customer 1: country OTHER, tier silver.
+Order 1 total: 6964.79445.
+Items for order 1: id 1-5.
+Item 1: product 6, qty 8, unit_price 362.27, line_total 2608.344.
+Discount for silver, qty 8 (bucket [5,9]): 0.10.
+So line_total = 8 * 362.27 * (1 - 0.10) = 8 * 362.27 * 0.9 = 8 * 326.043 = 2608.344. Matches.
+Item 2: qty 7, unit_price 269.94, line_total 1700.622.
+7 * 269.94 * 0.9 = 7 * 242.946 = 1700.622. Matches.
+Item 3: qty 2, unit_price 433.98, line_total 824.562.
+2 * 433.98 * 0.95 = 2 * 412.281 = 824.562. Matches (silver, qty 2 -> discount 0.05).
+Item 4: qty 5, unit_price 78.2, line_total 351.9.
+5 * 78.2 * 0.9 = 5 * 70.38 = 351.9. Matches.
+Item 5: qty 5, unit_price 126.87, line_total 570.915.
+5 * 126.87 * 0.9 = 5 * 114.183 = 570.915. Matches.
+Sum line_total = 2608.344 + 1700.622 + 824.562 + 351.9 + 570.915 = let's add:
+2608.344 + 1700.622 = 4308.966
++824.562 = 5133.528
++351.9 = 5485.428
++570.915 = 6056.343.
+Tax for OTHER: 0.15.
+Order total = 6056.343 * 1.15 = 6064.79445? Let's compute: 6056.343 * 1.15 = 6056.343 + 908.45145 = 6964.79445. Yes! Matches exactly.
+
+So order 1 derivation is correct.
+
+Let's check order 2:
+Customer 2: FR, gold.
+Order 2 total: 11030.8854.
+Items 6-14.
+Item 6: qty 8, unit_price 453.23, line_total 3081.964.
+Gold, qty 8 -> discount 0.15. 8 * 453.23 * 0.85 = 8 * 385.2455 = 3081.964. Yes.
+Item 7: qty 6, unit_price 100.31, line_total 511.581.
+6 * 100.31 * 0.85 = 6 * 85.2635 = 511.581. Yes.
+Item 8: qty 4, unit_price 85.84, line_total 309.024.
+Gold, qty 4 -> discount 0.10. 4 * 85.84 * 0.9 = 4 * 77.256 = 309.024. Yes.
+Item 9: qty 2, unit_price 112.4, line_total 202.32.
+2 * 112.4 * 0.9 = 2 * 101.16 = 202.32. Yes.
+Item 10: qty 6, unit_price 30.66, line_total 156.366.
+6 * 30.66 * 0.85 = 6 * 26.061 = 156.366. Yes.
+Item 11: qty 9, unit_price 65.71, line_total 502.6815.
+9 * 65.71 * 0.85 = 9 * 55.8535 = 502.6815. Yes.
+Item 12: qty 1, unit_price 410.93, line_total 369.837.
+1 * 410.93 * 0.9 = 369.837. Yes.
+Item 13: qty 8, unit_price 388.72, line_total 2643.296.
+8 * 388.72 * 0.85 = 8 * 330.412 = 2643.296. Yes.
+Item 14: qty 5, unit_price 333.02, line_total 1415.335.
+5 * 333.02 * 0.85 = 5 * 283.067 = 1415.335. Yes.
+Sum line_total: let's add.
+3081.964 + 511.581 = 3593.545
++309.024 = 3902.569
++202.32 = 4104.889
++156.366 = 4261.255
++502.6815 = 4763.9365
++369.837 = 5133.7735
++2643.296 = 7777.0695
++1415.335 = 9192.4045.
+Tax FR: 0.20.
+Order total = 9192.4045 * 1.20 = 9192.4045 + 1838.4809 = 11030.8854. Yes! Matches.
+
+So derivation seems correct for these.
+
+Given the complexity, it's likely derivation is correct for all. The transition violation is the intended answer.
+
+But let's double-check if there are any other transition violations besides order 99 and empty prev_status ones. Order 37: empty->delivered. If empty is considered NULL, it's not in allowed set. But the problem might consider empty as a valid "initial" state. However, order 99 is unambiguous. Also, are there any other orders with prev_status = shipped and status = pending? Let's scan: I saw order 99. Any others? Let's search for "pending,shipped" in the orders list? Actually order 99 is "pending,shipped" meaning status pending, prev_status shipped. Are there any "shipped,pending"? That would be status shipped, prev_status pending, which is allowed. We need status pending, prev_status shipped. Only order 99 seems to have that.
+
+What about status cancelled, prev_status shipped? Not allowed. Let's check if any: order 8 is cancelled,pending (allowed). Order 12 cancelled,pending. Order 17 cancelled,pending. Order 26 cancelled,pending. Order 39 cancelled,pending. Order 44 cancelled,pending. Order 48 cancelled,pending. Order 53 cancelled,pending. Order 54 cancelled,pending. Order 57 cancelled,pending. Order 58 cancelled,pending. Order 60 cancelled,pending. Order 61 cancelled,pending. Order 64 cancelled,pending. Order 68 cancelled,pending. Order 72 cancelled,pending. Order 77 cancelled,pending. Order 81 cancelled,pending. Order 82 cancelled,pending. Order 84 cancelled,pending. Order 85 cancelled,pending. Order 89 cancelled,pending. Order 90 cancelled,pending. Order 96 cancelled,pending. Order 103 cancelled,pending. Order 110 cancelled,pending. Order 114 cancelled,pending. Order 126 cancelled,pending. Order 129 cancelled,pending. Order 132 cancelled,pending. Order 133 cancelled,pending. Order 134 cancelled,pending. Order 139 cancelled,pending. Order 147 cancelled,pending. Order 152 cancelled,pending.
+
+All cancelled have prev_status pending. Good.
+
+Any delivered with prev_status pending? Not allowed. Let's check: order 37 is delivered, empty. Order 4-6 delivered, shipped. Order 9-11 delivered, shipped. Order 14-16 delivered, shipped. Order 19-23 delivered, shipped. Order 25 delivered, shipped. Order 32 delivered, shipped. Order 37 delivered, empty. Order 38 delivered, shipped. Order 41 delivered, shipped. Order 42 delivered, shipped. Order 47 delivered, shipped. Order 49-50 delivered, shipped. Order 51-52 delivered, shipped. Order 55 delivered, shipped. Order 56 delivered, shipped. Order 59 delivered, shipped. Order 65 delivered, shipped. Order 67 delivered, shipped. Order 69-70 delivered, shipped. Order 76 delivered, shipped. Order 83 delivered, shipped. Order 86-87 delivered, shipped. Order 91-92 delivered, shipped. Order 95 delivered, shipped. Order 97-98 delivered, shipped. Order 102 delivered, shipped. Order 104 delivered, shipped. Order 105-106 delivered, shipped. Order 107-109 delivered, shipped. Order 111-113 delivered, shipped. Order 115-116 delivered, shipped. Order 119-121 delivered, shipped. Order 124-125 delivered, shipped. Order 127 delivered, shipped. Order 130 delivered, shipped. Order 135 delivered, shipped. Order 138 delivered, shipped. Order 142 delivered, shipped. Order 146 delivered, shipped. Order 151 delivered, shipped.
+
+So only order 37 has delivered with empty prev_status. And order 99 has pending with prev_status shipped.
+
+Thus transition_break is present.
+
+Now, the question: should we output transition_break or maybe fk_break? Let's verify referential integrity more carefully. Orders.customer_id: all 1-50. Customers.id: 1-50. OK.
+
+Order_items.order_id: all from 1 to 156? Let's check if any order_id >156 or <1. The items go up to 1686. The last item has order_id 156. The first has order_id 1. Are there any order_ids missing in orders? Orders has ids 1..156. So all good.
+
+But wait: are there any orders with no items? We counted items for each order and found at least 1 for each. But we should verify that every order id from 1 to 156 appears in order_items. From our scan, we saw items for each order. Let's double-check if any order is missing. The items start at order 1 and go sequentially. We saw order 1,2,3,... up to 156. There were no gaps in the order_ids we observed. So every order has at least 1 item. And max per order is 20. So cardinality is fine.
+
+Thus the only violation is transition_break.
+
+But we need to be careful about the empty prev_status. If the problem expects that empty prev_status is treated as NULL and the transition rule only applies when prev_status is not NULL (i.e., initial insertion), then order 99 is still a violation because prev_status is 'shipped' and status is 'pending'. So transition_break is still correct.
+
+Alternatively, if the problem expects that empty prev_status is a violation, then also transition_break.
+
+Thus answer: {"label": "ILLEGAL", "violation": "transition_break"}.
+
+Before finalizing, let's consider if there is any derivation violation that might be the intended answer instead. The problem might have a subtle error in line_total or order_total. Let's check a few more orders, especially those with edge quantities (qty=1, qty=10, qty=20) and different tiers.
+
+Check order 10: customer 4 (JP, gold). Order 10 total: 7858.81745.
+Items for order 10: id 111-117.
+Item 111: qty 8, unit_price 304.02, line_total 2067.336.
+Gold, qty 8 -> discount 0.15. 8*304.02*0.85 = 8*258.417 = 2067.336. OK.
+Item 112: qty 3, unit_price 124.0, line_total 334.8.
+Gold, qty 3 -> discount 0.10. 3*124*0.9 = 334.8. OK.
+Item 113: qty 3, unit_price 218.41, line_total 589.707.
+3*218.41*0.9 = 3*196.569 = 589.707. OK.
+Item 114: qty 4, unit_price 362.73, line_total 1305.828.
+4*362.73*0.9 = 4*326.457 = 1305.828. OK.
+Item 115: qty 3, unit_price 206.43, line_total 557.361.
+3*206.43*0.9 = 557.361. OK.
+Item 116: qty 5, unit_price 444.25, line_total 1888.0625.
+5*444.25*0.85 = 5*377.6125 = 1888.0625. OK.
+Item 117: qty 5, unit_price 94.42, line_total 401.285.
+5*94.42*0.85 = 5*80.257 = 401.285. OK.
+Sum: 2067.336+334.8=2402.136; +589.707=2991.843; +1305.828=4297.671; +557.361=4855.032; +1888.0625=6743.0945; +401.285=7144.3795.
+Tax JP: 0.10.
+Order total = 7144.3795 * 1.10 = 7144.3795 + 714.43795 = 7858.81745. Matches.
+
+Check order 54: customer? Order 54 is customer 18 (DE, silver). Order 54 total: 28393.91646.
+Items 498-517 (20 items). Let's verify a few.
+Item 498: qty 1, unit_price 282.44, line_total 268.318.
+Silver, qty 1 -> discount 0.05. 1*282.44*0.95 = 268.318. OK.
+Item 499: qty 1, unit_price 328.72, line_total 312.284.
+1*328.72*0.95 = 312.284. OK.
+Item 500: qty 9, unit_price 360.69, line_total 2921.589.
+Silver, qty 9 -> discount 0.10. 9*360.69*0.9 = 9*324.621 = 2921.589. OK.
+Item 501: qty 10, unit_price 149.25, line_total 1313.4.
+Silver, qty 10 -> discount 0.12. 10*149.25*0.88 = 10*131.34 = 1313.4. OK.
+Item 502: qty 3, unit_price 177.8, line_total 506.73.
+3*177.8*0.95 = 3*168.91 = 506.73. OK.
+Item 503: qty 7, unit_price 461.6, line_total 2908.08.
+7*461.6*0.9 = 7*415.44 = 2908.08. OK.
+Item 504: qty 2, unit_price 333.31, line_total 633.289.
+2*333.31*0.95 = 2*316.6445 = 633.289. OK.
+Item 505: qty 9, unit_price 293.35, line_total 2376.135.
+9*293.35*0.9 = 9*264.015 = 2376.135. OK.
+Item 506: qty 9, unit_price 248.81, line_total 2015.361.
+9*248.81*0.9 = 9*223.929 = 2015.361. OK.
+Item 507: qty 7, unit_price 306.39, line_total 1930.257.
+7*306.39*0.9 = 7*275.751 = 1930.257. OK.
+Item 508: qty 10, unit_price 150.97, line_total 1328.536.
+10*150.97*0.88 = 10*132.8536 = 1328.536. OK.
+Item 509: qty 5, unit_price 415.18, line_total 1868.31.
+5*415.18*0.9 = 5*373.662 = 1868.31. OK.
+Item 510: qty 8, unit_price 143.46, line_total 1032.912.
+8*143.46*0.9 = 8*129.114 = 1032.912. OK.
+Item 511: qty 8, unit_price 28.11, line_total 202.392.
+8*28.11*0.9 = 8*25.299 = 202.392. OK.
+Item 512: qty 3, unit_price 311.26, line_total 887.091.
+3*311.26*0.95 = 3*295.697 = 887.091. OK.
+Item 513: qty 4, unit_price 426.95, line_total 1622.41.
+4*426.95*0.95 = 4*405.6025 = 1622.41. OK.
+Item 514: qty 1, unit_price 279.7, line_total 265.715.
+1*279.7*0.95 = 265.715. OK.
+Item 515: qty 2, unit_price 56.74, line_total 107.806.
+2*56.74*0.95 = 2*53.903 = 107.806. OK.
+Item 516: qty 5, unit_price 32.55, line_total 146.475.
+5*32.55*0.9 = 5*29.295 = 146.475. OK.
+Item 517: qty 8, unit_price 168.52, line_total 1213.344.
+8*168.52*0.9 = 8*151.668 = 1213.344. OK.
+Sum line_total: let's sum roughly. Many items. But likely correct. Tax DE: 0.19. Order total = sum * 1.19. The given total is 28393.91646. If sum = 28393.91646 / 1.19 = 23860.434... Hard to verify manually, but given the pattern, it's likely correct.
+
+Given that the first two orders matched perfectly, and the data seems systematically generated, derivation is likely correct.
+
+Thus the answer is transition_break.
+
+One more check: order 37 has prev_status empty and status delivered. If empty is NULL, then it's a violation. But order 99 is also a violation. So transition_break is solid.
+
+Therefore output: {"label": "ILLEGAL", "violation": "transition_break"}.
+
+Wait, the prompt says "Reply with a single JSON object on one line, no prose". So I must output exactly that.
+
+Double-check: Are there any orders with prev_status = 'shipped' and status = 'pending'? Only order 99. Are there any with prev_status = 'delivered'? No. Are there any with prev_status = 'cancelled'? No. So the only non-empty illegal transition is order 99.
+
+But what about order 100: prev_status empty, status pending. If empty is considered as prev_status = NULL, then it's not in the allowed set. However, maybe the empty string in CSV is actually the value 'pending' but due to some quoting issue? No, the CSV shows `pending,,2022...` so it's empty.
+
+Actually, in the trigger code, the allowed set includes ['pending','pending'] as initial state. The comment says "initial state". That implies that when an order is created, it should have prev_status='pending' and status='pending'. But the data shows empty prev_status for initial state. This is a discrepancy. However, the natural language rule says the pair must be in the allowed set. So empty is not allowed. But if we strictly follow the natural language rule, there are many violations (all initial orders). That would make the answer transition_break, but it's a bit unsatisfying because it's so many. But the problem might be designed to test whether we notice that empty prev_status is not in the allowed set. However, the presence of order 99 gives a more "interesting" violation.
+
+Wait, maybe the empty prev_status is actually the string 'pending' but the CSV is missing it because of a formatting error? Let's look at the raw CSV lines:
+
+```
+3,2,pending,,2022-12-21,29725.4304
+...
+30,10,pending,,2022-04-07,13988.98074
+```
+
+If prev_status were 'pending', it would be `3,2,pending,pending,2022-12-21,...`. So it's definitely empty.
+
+But maybe the empty string is considered as 'pending' by convention in this dataset? The problem statement doesn't say that. It says the pair (prev_status, status) must lie in the allowed set. So empty is not allowed.
+
+However, if we consider the trigger code, it would allow NULL prev_status. The problem says "A PL/pgSQL trigger function that enforces the legal status-transition set." Then in the classification rules, it says "Status transition: the pair (prev_status, status) of every order lies in the allowed set ...". This is a direct restatement. It doesn't say "or NULL". So empty/NULL is a violation.
+
+But if empty/NULL is a violation, then there are ~20 violations. The question asks to classify the state. It doesn't ask to count violations. So any violation makes it ILLEGAL. The type is transition_break.
+
+But is there any chance that the empty prev_status is actually a representation of NULL, and the rule is that the pair must be in the allowed set OR prev_status IS NULL? The natural language doesn't say that. But the trigger code is given as the procedural rule. The trigger code does not enforce it for NULL. So the operational rule family (iv) is the trigger. The classification bullet says "Status transition: the pair (prev_status, status) of every order lies in the allowed set ...". This might be a simplification. But if the trigger is the actual rule, then NULL prev_status is allowed. In that case, order 99 is still a violation because prev_status is 'shipped', not NULL. So transition_break still holds.
+
+Thus regardless of interpretation of empty prev_status, order 99 causes transition_break.
+
+Therefore the answer is definitely transition_break.
+
+I will output the JSON.

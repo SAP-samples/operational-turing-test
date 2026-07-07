@@ -1,0 +1,63 @@
+We need to classify the state as LEGAL or ILLEGAL based on four checks: referential integrity (fk_break), cardinality (cardinality_break), derivation (derivation_break), status transition (transition_break).
+
+We have three CSV files: customers, orders, order_items.
+
+First, let's parse the data. There are 50 customers (id 1-50). Orders: id 1 to 151. Order_items: id 1 to 1573.
+
+We need to check:
+
+1. Referential integrity:
+   - Every orders.customer_id must be in customers.id.
+   - Every order_items.order_id must be in orders.id.
+
+2. Cardinality:
+   - Each order has 1-20 line items. Count items per order.
+   - Each customer has at most 3 open orders (status in {pending, shipped}). Count open orders per customer.
+
+3. Derivation:
+   - line_total = quantity * unit_price * (1 - discount(tier, quantity))
+   - order.total = sum(line_total for items in this order) * (1 + tax(country))
+   - discount table based on tier and quantity bucket.
+   - tax based on country.
+
+4. Status transition:
+   - For every order, (prev_status, status) must be in allowed set: {(pending, shipped), (shipped, delivered), (pending, cancelled), (pending, pending)}.
+   - Note: prev_status can be NULL/empty for initial state? The allowed set includes ['pending','pending'] and the trigger checks ARRAY[NEW.prev_status, NEW.status] = ANY(allowed). If prev_status is NULL, then ARRAY[NULL, 'pending'] would not match any of the allowed arrays (which are text arrays without NULL). However, in the CSV, prev_status is empty for some rows (e.g., order 3: prev_status is empty, status pending). The trigger would raise exception if prev_status is NULL and status is pending, because ARRAY[NULL,'pending'] is not equal to ARRAY['pending','pending'] (since NULL != 'pending'). But wait: in PostgreSQL, ARRAY[NULL, 'pending'] = ARRAY['pending','pending'] yields NULL, not false? Actually, array equality checks element-wise. NULL = 'pending' yields NULL, so the whole array equality yields NULL. Then = ANY(allowed) would be NULL = ANY(...)? Let's think: The condition is `IF NOT (ARRAY[NEW.prev_status, NEW.status] = ANY (allowed))`. If the array equality returns NULL (because prev_status is NULL), then NOT NULL is NULL, and in PL/pgSQL, IF NULL THEN ...? In PL/pgSQL, a boolean expression that is NULL is treated as false in an IF condition? Actually, in PL/pgSQL, the condition in IF must be boolean. If it's NULL, it's treated as false? Let's recall: In SQL, `IF NULL THEN` is not standard, but in PL/pgSQL, the expression is evaluated in a boolean context. According to docs, a NULL result is treated as false. Wait, is that correct? Let's check: In PL/pgSQL, `IF expression THEN ...` where expression is boolean. If expression is NULL, it's treated as false. Actually, I think PL/pgSQL treats NULL as false in IF statements. But the trigger might be designed to allow NULL prev_status? The allowed set does not include NULL. However, the CSV shows empty prev_status for pending orders. The problem statement says: "the pair (prev_status, status) of every order lies in the allowed set". If prev_status is empty/NULL, does it match any allowed pair? The allowed set is a four-element relation over (prev_status, status). It does not include (NULL, pending). So if prev_status is NULL, it's not in the allowed set. But maybe the empty string in CSV is considered NULL. Let's examine the orders.csv: for order 3, prev_status is empty. Similarly order 5, 15, 18, 27, 36, 42, 44, 49, 52, 55, 61, 62, 67, 70, 72, 74, 82, 83, 86, 90, 91, 93, 95, 103, 104, 113, 123, 129, 142, 147, 148. Many have empty prev_status and status pending. If empty string is treated as NULL, then transition_break. But maybe empty string is considered as '' (empty string), not NULL. In PostgreSQL, a VARCHAR can be empty string. The trigger compares ARRAY[NEW.prev_status, NEW.status] with allowed arrays of text. If prev_status is '' (empty string), then ARRAY['', 'pending'] is not equal to any allowed array. So that would also be illegal. However, the problem statement says the legal-transition set is exactly those four pairs. So any order with prev_status not in {'pending', 'shipped'} or status not matching accordingly is illegal. But many orders have prev_status empty and status pending. Are those considered legal? The trigger function in the problem is given as the procedural rule. We need to determine if the state violates the trigger. The trigger checks `ARRAY[NEW.prev_status, NEW.status] = ANY (allowed)`. If prev_status is NULL or empty string, this array is not equal to any of the allowed arrays. So the trigger would raise an exception. But wait: the allowed array includes `['pending', 'pending']`. If prev_status is NULL, ARRAY[NULL, 'pending'] is not equal to ARRAY['pending','pending']. In PostgreSQL, array equality requires all elements equal. NULL != 'pending', so it's false. So NOT false = true, exception raised. If prev_status is empty string '', ARRAY['','pending'] is not equal to ARRAY['pending','pending'], so false, NOT false = true, exception. So those rows would be illegal under the trigger.
+
+But is that the intended interpretation? The problem says: "Status transition: the pair (prev_status, status) of every order lies in the allowed set {(pending, shipped), (shipped, delivered), (pending, cancelled), (pending, pending)}." It doesn't mention NULL or empty string. The CSV shows empty values for prev_status. In many contexts, an empty string in a CSV for a VARCHAR column might represent NULL or just empty. However, the DDL does not have a NOT NULL constraint on prev_status. The trigger uses `NEW.prev_status`. If it's NULL, the array contains NULL. The equality check fails. So those orders would violate the transition rule.
+
+But let's look at the orders: many have prev_status empty and status pending. If all those are violations, then the state is ILLEGAL with transition_break. But maybe the empty string is considered as 'pending'? No, that doesn't make sense. Or maybe the initial state is represented by prev_status being NULL/empty, but the trigger is supposed to allow it? The trigger code as given does not allow it. The problem says: "This trigger is the procedural component of operational rule family (iv)." And the rule is: "the pair (prev_status, status) of every order lies in the allowed set". So we must apply exactly that. If prev_status is empty/NULL, the pair is not in the set. So transition_break.
+
+However, before concluding, we should check if there are any other violations that might be the intended answer. Perhaps the empty prev_status is meant to be interpreted as NULL, and the trigger as given in the problem is what we must emulate. The problem says: "A state is LEGAL iff every one of the following holds." It lists the four checks. For status transition, it says: "the pair (prev_status, status) of every order lies in the allowed set ...". So we just check that pair. If prev_status is empty string, it's not in the set. So it's a transition_break.
+
+But wait, maybe the CSV uses empty string to mean NULL, and the problem expects us to treat NULL as not matching. So yes, transition_break.
+
+But let's verify other checks to see if there might be a more "obvious" violation like fk_break. There are orders with customer_id not in customers: order 43 has customer_id 232, order 61 has customer_id 61, order 79 has customer_id 645, order 80 has customer_id 477, order 84 has customer_id 331, order 140 has customer_id 974, order 141 has customer_id 122. Those are definitely fk_break. So the state is illegal due to fk_break. Since a single violation makes it illegal, and fk_break is present, the answer is {"label":"ILLEGAL","violation":"fk_break"}.
+
+We should verify: customers.csv has ids 1-50. Orders.csv has customer_ids: 1,2,3,...50, but also 232, 61, 645, 477, 331, 974, 122. Let's list them:
+
+Order 43: customer_id 232. Not in 1-50.
+Order 61: customer_id 61. Not in 1-50.
+Order 79: customer_id 645. Not in 1-50.
+Order 80: customer_id 477. Not in 1-50.
+Order 84: customer_id 331. Not in 1-50.
+Order 140: customer_id 974. Not in 1-50.
+Order 141: customer_id 122. Not in 1-50.
+
+So referential integrity is broken. Therefore, the state is ILLEGAL, violation fk_break.
+
+We don't need to check other things, but for completeness, we can note that there are also likely transition violations (empty prev_status), and possibly cardinality or derivation issues. But the first check fails.
+
+Thus answer: {"label":"ILLEGAL","violation":"fk_break"}
+
+We must output exactly one JSON object on one line, no prose.
+
+Double-check: Are there any order_items.order_id not in orders.id? Orders go up to 151. Order_items have order_id up to 151? Let's see: the last order_item is 1573 with order_id 151. So likely all order_ids in items are valid. But there might be order_ids in items that are not in orders? Let's check quickly: order_items.csv has order_id values. The max order_id seems 151. Are there any missing order_ids? For example, order 43 exists in orders (customer_id 232). So order_items for order 43 would be valid referentially to orders. But the fk from orders to customers is broken for those orders. The question says: "Referential integrity: every orders.customer_id occurs in customers.id; every order_items.order_id occurs in orders.id." So both must hold. The first part fails.
+
+Thus the violation is fk_break.
+
+We should ensure that we don't need to check the second part of FK (order_items.order_id in orders.id). But since the first part fails, it's already illegal.
+
+Therefore, final answer: {"label":"ILLEGAL","violation":"fk_break"}
+
+One line, no markdown.

@@ -1,0 +1,1834 @@
+We need to verify whether the given database state is LEGAL according to the four rules: referential integrity, cardinality (1-20 line items per order, at most 3 open orders per customer), derivation (line_total and order.total), and status transition.
+
+We have three tables: customers (50 rows), orders (142 rows), order_items (1483 rows). We need to check each rule.
+
+First, referential integrity:
+- Every orders.customer_id must be in customers.id. customers.id are 1..50. orders.customer_id range 1..50? Let's check orders.csv: customer_id values from 1 to 50. All present.
+- Every order_items.order_id must be in orders.id. orders.id are 1..142. order_items.order_id range 1..142? Let's check. The order_items.csv has order_id up to 142. Need to ensure all order_ids in order_items exist in orders. Since orders.id goes up to 142 and order_items.order_id seems within that range, likely okay. But we need to check if any order_id in order_items is missing from orders. The orders list includes ids 1..142. Let's verify quickly: orders.csv has rows 1 to 142. Yes. So referential integrity holds.
+
+Second, cardinality:
+- Each order must have 1-20 line items. We need to count items per order. There are 142 orders and 1483 items. Average ~10.4. We need to check if any order has 0 items or >20 items. Since there are many items, likely each order has at least 1. But we need to verify none have >20. We can count per order. Let's tally. Since we cannot run code, we need to manually or logically check. But maybe there is a violation in derivation or cardinality that is easier to spot. However, we must be thorough.
+
+- Each customer has at most 3 open orders (status in {pending, shipped}). We need to count open orders per customer.
+
+Third, derivation:
+- line_total = quantity * unit_price * (1 - discount(tier, quantity))
+- discount depends on tier and quantity bucket:
+  - bronze: [1,4]:0.00, [5,9]:0.05, [10,19]:0.07
+  - silver: [1,4]:0.05, [5,9]:0.10, [10,19]:0.12
+  - gold: [1,4]:0.10, [5,9]:0.15, [10,19]:0.20
+  (quantity always in [1,20]; bucket closed at 19, so qty=20? Not in discount table? The description says "quantity is always in [1, 20]; the maximum bucket is closed at 19, and quantity = 20 is a per-order cardinality bound, not a discount band." This implies discount for qty=20 is not defined in the table. But maybe quantity never exceeds 19 in items? We need to check if any quantity >19. The check says quantity >0 and <=20? Actually DDL only says quantity > 0. The procedural rule says quantity is always in [1,20]. But discount table only covers up to 19. If quantity=20, what discount? The rule says quantity=20 is a per-order cardinality bound, not a discount band. Maybe discount for 20 is same as 19? Or maybe there are no quantity=20 items. Let's check. We need to see if any line item has quantity=20. If so, discount is undefined, but maybe the rule implies quantity never equals 20 in items? Actually "quantity is always in [1, 20]; the maximum bucket is closed at 19, and quantity = 20 is a per-order cardinality bound, not a discount band." This could mean that the discount function is only defined for 1-19, and quantity=20 is allowed but not used? Or maybe it's allowed but discount is not defined, which would be a problem. However, the per-order item count is 1-20 line items, not quantity. The quantity column is per line item. The rule says "quantity is always in [1, 20]". So quantity can be up to 20. But discount table only has bands up to 19. For quantity=20, maybe discount is 0? Or maybe it's not present. Let's scan for quantity=20 in order_items. I see some quantity 10, 9, 8, etc. I need to check if any quantity=20. Let's search mentally or by scanning. The CSV is large. I can look for ",20," in the quantity column. Scanning through: I see quantities like 2,2,5,3,3,5,3,8,3,3,9,7,3,4,6,5,3,6,8,3,4,8,3,4,10,5,8,7,10,6,5,8,7,10,1,10,9,1,4,5,1,4,1,4,7,1,4,7,6,3,8,9,1,9,8,10,6,3,7,1,6,3,5,5,5,8,2,8,3,5,4,4,5,1,7,6,1,4,7,1,6,3,5,5,8,2,6,5,8,2,6,5,8,10,7,4,9,7,2,9,8,10,6,3,5,5,8,2,6,5,8,10,7,4,9,7,2,9,8,10,6,3,5,5,8,2,6,5,8,10,7,4,9,7,2,9,8,10,6,3,5,5,8,2,6,5,8,10,7,4,9,7,2,9,8,10... I don't see any 20. Maybe there are none. Good.
+
+- order.total = sum(line_total for items in this order) * (1 + tax(country))
+  tax(country): DE 0.19, FR 0.20, GB 0.20, JP 0.10, US 0.08, other 0.15.
+
+We need to compute for each order? That's a lot (142 orders). But maybe there is a violation that is obvious. Or maybe we can find a discrepancy by checking a few. However, the problem likely expects us to find a specific violation. Let's check the rules one by one.
+
+First, check status transitions. Allowed pairs: (pending, shipped), (shipped, delivered), (pending, cancelled), (pending, pending). Note that prev_status can be NULL? The trigger uses ARRAY[NEW.prev_status, NEW.status] = ANY (allowed). If prev_status is NULL, then ARRAY[NULL, 'pending'] would not match any allowed array because allowed arrays have text values. However, in the orders.csv, for initial state orders (like order 4: pending, prev_status empty), prev_status is empty. In CSV it's blank. In the database, that would be NULL or empty string? The DDL says prev_status VARCHAR(20), no NOT NULL. The trigger would compare ARRAY[NULL, 'pending'] against allowed text arrays. In PostgreSQL, ARRAY[NULL, 'pending'] is not equal to any of the allowed arrays because those are {'pending','shipped'} etc. So if prev_status is NULL, the trigger would raise an exception. But maybe the application inserts initial orders with prev_status = 'pending'? Wait, the allowed set includes (pending, pending) as initial state. So prev_status must be 'pending' for initial state, not NULL. In the CSV, some rows have prev_status blank. For example, order 4: id=4, status=pending, prev_status= (blank). If that is inserted as NULL or empty string, it violates the trigger. However, maybe the CSV just leaves it blank but the actual value is NULL. The trigger would reject it. But the problem says "A state is LEGAL iff every one of the following holds." The status transition rule is enforced by the trigger. So we need to check if any order has prev_status not in allowed pairs.
+
+Let's list orders with blank prev_status: 
+Order 4: pending, prev blank.
+Order 6: pending, prev blank.
+Order 7: pending, prev blank.
+Order 9: pending, prev blank.
+Order 14: pending, prev blank.
+Order 18: pending, prev blank.
+Order 25: pending, prev blank.
+Order 28: pending, prev blank.
+Order 40: pending, prev blank.
+Order 41: pending, prev blank.
+Order 50: pending, prev blank.
+Order 54: pending, prev blank.
+Order 65: pending, prev blank.
+Order 66: pending, prev blank.
+Order 76: pending, prev blank.
+Order 77: pending, prev blank.
+Order 80: pending, prev blank.
+Order 88: pending, prev blank.
+Order 89: pending, prev blank.
+Order 96: pending, prev blank.
+Order 97: pending, prev blank.
+Order 100: pending, prev blank.
+Order 106: pending, prev blank.
+Order 109: pending, prev blank.
+Order 115: pending, prev blank.
+Order 116: pending, prev blank.
+Order 126: pending, prev blank.
+Order 127: pending, prev blank.
+Order 128: pending, prev blank.
+Order 129: pending, prev blank.
+Order 131: pending, prev blank.
+Order 132: pending, prev blank.
+
+Wait, many orders have blank prev_status and status pending. The allowed set includes (pending, pending). But if prev_status is blank (NULL or empty), does it match (pending, pending)? No. So these would violate the transition rule. However, maybe the blank in CSV means prev_status is NULL, and the trigger as written would reject it. But the problem might consider blank as NULL. If so, that's a transition_break.
+
+But wait: the trigger uses ARRAY[NEW.prev_status, NEW.status] = ANY (allowed). In PostgreSQL, if NEW.prev_status is NULL, the array contains NULL. The equality operator for arrays with NULL returns NULL (not true). So the IF NOT condition would be NOT NULL which is NULL, and in a boolean context, NULL is treated as false? Actually in PL/pgSQL, IF NOT (NULL) then ...? Let's recall: In PostgreSQL PL/pgSQL, the condition in IF is evaluated as a boolean expression. If the result is NULL, it is treated as false. So IF NOT (NULL) THEN ... would be false? Wait: NOT NULL is NULL. Then IF NULL THEN ... is false (it does not execute the THEN block). So the trigger would NOT raise an exception if prev_status is NULL. Let's verify: In PL/pgSQL, a boolean expression that yields NULL is treated as false in conditionals. Yes. So if prev_status is NULL, ARRAY[NULL, 'pending'] = ANY(allowed) returns NULL (since comparison with NULL yields NULL). NOT NULL is NULL. IF NULL THEN ... is false, so it does not enter the THEN block. It returns NEW. So NULL prev_status is allowed by this trigger! Interesting. So blank prev_status might be okay. But is that intended? The problem says "the pair (prev_status, status) of every order lies in the allowed set". If prev_status is NULL, the pair (NULL, pending) is not in the allowed set (which consists of text pairs). However, the trigger as written might allow it due to NULL handling. The problem says "Status transition: the pair (prev_status, status) of every order lies in the allowed set". This is a rule about the state, not about the trigger's behavior? The description says "This trigger is the procedural component of operational rule family (iv)." Then the task says: "A state is LEGAL iff every one of the following holds: ... Status transition: the pair (prev_status, status) of every order lies in the allowed set ..." So we must check the pair itself, not just whether the trigger would fire. The allowed set is a four-element relation over (prev_status, status). It does not include NULL. So if prev_status is NULL, that pair is not in the set. But wait, the orders with blank prev_status are initial orders. The allowed set includes (pending, pending) as initial state. So maybe the initial state should have prev_status = 'pending'. The blank might be a CSV representation of NULL, which would violate the rule because the pair (NULL, pending) is not allowed. However, maybe the blank means prev_status is empty string? The DDL says VARCHAR(20). Empty string is not NULL. ARRAY['', 'pending'] = ANY(allowed) would be false (since none of the allowed arrays have '' as first element). Then NOT false is true, and the trigger would raise. So empty string would definitely be a violation. But in the CSV, blank could be NULL. The problem says "Database state, presented as the contents of three CSV files". In CSV, blank often means NULL. But we need to decide based on the rule: "the pair (prev_status, status) of every order lies in the allowed set". The allowed set does not have NULL. So if prev_status is NULL, it's a violation. But is there any order where prev_status is not NULL and not in allowed set? Let's check.
+
+Orders with non-blank prev_status:
+Order 1: delivered, shipped -> allowed (shipped, delivered).
+Order 2: delivered, shipped -> allowed.
+Order 3: delivered, shipped -> allowed.
+Order 5: cancelled, pending -> allowed (pending, cancelled).
+Order 8: shipped, pending -> allowed (pending, shipped).
+Order 10: delivered, shipped -> allowed.
+Order 11: delivered, shipped -> allowed.
+Order 12: delivered, shipped -> allowed.
+Order 13: delivered, shipped -> allowed.
+Order 15: cancelled, pending -> allowed.
+Order 16: shipped, pending -> allowed.
+Order 17: shipped, pending -> allowed.
+Order 19: shipped, pending -> allowed.
+Order 20: shipped, pending -> allowed.
+Order 21: shipped, pending -> allowed.
+Order 22: delivered, shipped -> allowed.
+Order 23: cancelled, pending -> allowed.
+Order 24: delivered, shipped -> allowed.
+Order 26: delivered, shipped -> allowed.
+Order 27: shipped, pending -> allowed.
+Order 29: delivered, shipped -> allowed.
+Order 30: shipped, pending -> allowed.
+Order 31: cancelled, pending -> allowed.
+Order 32: cancelled, pending -> allowed.
+Order 33: delivered, shipped -> allowed.
+Order 34: delivered, shipped -> allowed.
+Order 35: cancelled, pending -> allowed.
+Order 36: cancelled, pending -> allowed.
+Order 37: delivered, shipped -> allowed.
+Order 38: cancelled, pending -> allowed.
+Order 39: delivered, shipped -> allowed.
+Order 42: shipped, pending -> allowed.
+Order 43: delivered, shipped -> allowed.
+Order 44: delivered, shipped -> allowed.
+Order 45: shipped, pending -> allowed.
+Order 46: shipped, pending -> allowed.
+Order 47: shipped, pending -> allowed.
+Order 48: delivered, shipped -> allowed.
+Order 49: delivered, shipped -> allowed.
+Order 51: cancelled, pending -> allowed.
+Order 52: shipped, pending -> allowed.
+Order 53: shipped, pending -> allowed.
+Order 55: cancelled, pending -> allowed.
+Order 56: cancelled, pending -> allowed.
+Order 57: delivered, shipped -> allowed.
+Order 58: delivered, shipped -> allowed.
+Order 59: shipped, pending -> allowed.
+Order 60: cancelled, pending -> allowed.
+Order 61: delivered, shipped -> allowed.
+Order 62: delivered, shipped -> allowed.
+Order 63: delivered, shipped -> allowed.
+Order 64: delivered, shipped -> allowed.
+Order 67: shipped, pending -> allowed.
+Order 68: delivered, shipped -> allowed.
+Order 69: cancelled, pending -> allowed.
+Order 70: cancelled, pending -> allowed.
+Order 71: delivered, shipped -> allowed.
+Order 72: delivered, shipped -> allowed.
+Order 73: delivered, shipped -> allowed.
+Order 74: delivered, shipped -> allowed.
+Order 75: delivered, shipped -> allowed.
+Order 78: delivered, shipped -> allowed.
+Order 79: delivered, shipped -> allowed.
+Order 81: shipped, pending -> allowed.
+Order 82: shipped, pending -> allowed.
+Order 83: delivered, shipped -> allowed.
+Order 84: delivered, shipped -> allowed.
+Order 85: cancelled, pending -> allowed.
+Order 86: cancelled, pending -> allowed.
+Order 87: delivered, shipped -> allowed.
+Order 90: delivered, shipped -> allowed.
+Order 91: cancelled, pending -> allowed.
+Order 92: delivered, shipped -> allowed.
+Order 93: delivered, shipped -> allowed.
+Order 94: shipped, pending -> allowed.
+Order 95: delivered, shipped -> allowed.
+Order 98: shipped, pending -> allowed.
+Order 99: cancelled, pending -> allowed.
+Order 101: delivered, shipped -> allowed.
+Order 102: shipped, pending -> allowed.
+Order 103: cancelled, pending -> allowed.
+Order 104: delivered, shipped -> allowed.
+Order 105: cancelled, pending -> allowed.
+Order 107: cancelled, pending -> allowed.
+Order 108: shipped, pending -> allowed.
+Order 110: delivered, shipped -> allowed.
+Order 111: delivered, shipped -> allowed.
+Order 112: shipped, pending -> allowed.
+Order 113: delivered, shipped -> allowed.
+Order 114: shipped, pending -> allowed.
+Order 117: cancelled, pending -> allowed.
+Order 118: cancelled, pending -> allowed.
+Order 119: delivered, shipped -> allowed.
+Order 120: shipped, pending -> allowed.
+Order 121: shipped, pending -> allowed.
+Order 122: shipped, pending -> allowed.
+Order 123: shipped, pending -> allowed.
+Order 124: delivered, shipped -> allowed.
+Order 125: cancelled, pending -> allowed.
+Order 130: shipped, pending -> allowed.
+Order 133: delivered, shipped -> allowed.
+Order 134: cancelled, pending -> allowed.
+Order 135: delivered, shipped -> allowed.
+Order 136: delivered, shipped -> allowed.
+Order 137: cancelled, pending -> allowed.
+Order 138: shipped, pending -> allowed.
+Order 139: delivered, shipped -> allowed.
+Order 140: delivered, shipped -> allowed.
+Order 141: cancelled, pending -> allowed.
+Order 142: delivered, shipped -> allowed.
+
+All non-blank prev_status pairs are allowed. The only question is whether blank prev_status is considered a violation. The rule says "the pair (prev_status, status) of every order lies in the allowed set". The allowed set is {(pending, shipped), (shipped, delivered), (pending, cancelled), (pending, pending)}. If prev_status is NULL, the pair is not in the set. So that would be a transition_break. But is there any other violation? Let's check cardinality: at most 3 open orders per customer. Let's count open orders per customer.
+
+Open = status in {pending, shipped}. Let's tally per customer.
+
+Customer 1: orders 1(delivered),2(delivered),3(delivered),4(pending). Open: 1 (order 4). OK.
+Customer 2: orders 5(cancelled),6(pending),7(pending). Open: 2. OK.
+Customer 3: orders 8(shipped),9(pending). Open: 2. OK.
+Customer 4: orders 10(delivered),11(delivered),12(delivered),13(delivered),14(pending). Open: 1. OK.
+Customer 5: order 15(cancelled). Open: 0. OK.
+Customer 6: orders 16(shipped),17(shipped),18(pending). Open: 3. OK (max 3).
+Customer 7: orders 19(shipped),20(shipped),21(shipped). Open: 3. OK.
+Customer 8: orders 22(delivered),23(cancelled),24(delivered),25(pending). Open: 1. OK.
+Customer 9: orders 26(delivered),27(shipped),28(pending). Open: 2. OK.
+Customer 10: orders 29(delivered),30(shipped). Open: 1. OK.
+Customer 11: orders 31(cancelled),32(cancelled),33(delivered),34(delivered),35(cancelled). Open: 0. OK.
+Customer 12: orders 36(cancelled),37(delivered),38(cancelled),39(delivered). Open: 0. OK.
+Customer 13: orders 40(pending),41(pending). Open: 2. OK.
+Customer 14: order 42(shipped). Open: 1. OK.
+Customer 15: order 43(delivered). Open: 0. OK.
+Customer 16: orders 44(delivered),45(shipped),46(shipped),47(shipped). Open: 3. OK.
+Customer 17: orders 48(delivered),49(delivered),50(pending). Open: 1. OK.
+Customer 18: order 51(cancelled). Open: 0. OK.
+Customer 19: orders 52(shipped),53(shipped),54(pending). Open: 3. OK.
+Customer 20: orders 55(cancelled),56(cancelled),57(delivered),58(delivered),59(shipped). Open: 1. OK.
+Customer 21: orders 60(cancelled),61(delivered). Open: 0. OK.
+Customer 22: order 62(delivered). Open: 0. OK.
+Customer 23: orders 63(delivered),64(delivered),65(pending),66(pending),67(shipped). Open: 3. OK.
+Customer 24: orders 68(delivered),69(cancelled),70(cancelled). Open: 0. OK.
+Customer 25: orders 71(delivered),72(delivered),73(delivered),74(delivered). Open: 0. OK.
+Customer 26: orders 75(delivered),76(pending),77(pending). Open: 2. OK.
+Customer 27: orders 78(delivered),79(delivered),80(pending),81(shipped),82(shipped). Open: 3. OK.
+Customer 28: orders 83(delivered),84(delivered),85(cancelled),86(cancelled),87(delivered). Open: 0. OK.
+Customer 29: orders 88(pending),89(pending). Open: 2. OK.
+Customer 30: orders 90(delivered),91(cancelled),92(delivered),93(delivered),94(shipped). Open: 1. OK.
+Customer 31: orders 95(delivered),96(pending),97(pending),98(shipped). Open: 3. OK.
+Customer 32: orders 99(cancelled),100(pending). Open: 1. OK.
+Customer 33: orders 101(delivered),102(shipped). Open: 1. OK.
+Customer 34: orders 103(cancelled),104(delivered),105(cancelled). Open: 0. OK.
+Customer 35: order 106(pending). Open: 1. OK.
+Customer 36: orders 107(cancelled),108(shipped),109(pending). Open: 2. OK.
+Customer 37: orders 110(delivered),111(delivered). Open: 0. OK.
+Customer 38: order 112(shipped). Open: 1. OK.
+Customer 39: orders 113(delivered),114(shipped),115(pending),116(pending). Open: 4! Wait: orders for customer 39: 113(delivered),114(shipped),115(pending),116(pending). That's 2 pending + 1 shipped = 3 open? Actually open means status in {pending, shipped}. So order 114 is shipped (open), 115 pending (open), 116 pending (open). That's 3 open. Order 113 is delivered (closed). So open count = 3. OK.
+Customer 40: orders 117(cancelled),118(cancelled),119(delivered). Open: 0. OK.
+Customer 41: orders 120(shipped),121(shipped),122(shipped). Open: 3. OK.
+Customer 42: order 123(shipped). Open: 1. OK.
+Customer 43: orders 124(delivered),125(cancelled). Open: 0. OK.
+Customer 44: orders 126(pending),127(pending). Open: 2. OK.
+Customer 45: order 128(pending). Open: 1. OK.
+Customer 46: orders 129(pending),130(shipped). Open: 2. OK.
+Customer 47: orders 131(pending),132(pending). Open: 2. OK.
+Customer 48: order 133(shipped). Open: 1. OK.
+Customer 49: orders 134(cancelled),135(delivered),136(delivered),137(cancelled),138(shipped). Open: 1. OK.
+Customer 50: orders 139(delivered),140(delivered),141(cancelled),142(delivered). Open: 0. OK.
+
+So cardinality for open orders seems okay (max 3). Now check per-order item count (1-20). We need to count items per order. Let's see if any order has >20 items or 0 items. Since there are 1483 items for 142 orders, average ~10.4. It's possible some have >20. We need to check. Let's tally counts per order. This is tedious but we can try to find any order with many items. The order_items are grouped by order_id. Let's scan the order_items.csv and note the number of rows per order_id.
+
+I'll go through the order_items list and count per order. The list is sorted by id, but order_id may not be monotonic? Let's check: order_id sequence: 1,1,1,... then 2,2,... It seems grouped by order_id. Let's verify: first 37 items are order 1? Actually let's check.
+
+Order_items:
+id 1-10: order_id 1 (10 items)
+id 11-17: order_id 2 (7 items)
+id 18-37: order_id 3 (20 items)
+id 38-48: order_id 4 (11 items)
+id 49-63: order_id 5 (15 items)
+id 64-82: order_id 6 (19 items)
+id 83-87: order_id 7 (5 items)
+id 88-107: order_id 8 (20 items)
+id 108-115: order_id 9 (8 items)
+id 116-119: order_id 10 (4 items)
+id 120-126: order_id 11 (7 items)
+id 127-130: order_id 12 (4 items)
+id 131-138: order_id 13 (8 items)
+id 139-146: order_id 14 (8 items)
+id 147-163: order_id 15 (17 items)
+id 164-179: order_id 16 (16 items)
+id 180-190: order_id 17 (11 items)
+id 191-195: order_id 18 (5 items)
+id 196-201: order_id 19 (6 items)
+id 202-212: order_id 20 (11 items)
+id 213-222: order_id 21 (10 items)
+id 223-236: order_id 22 (14 items)
+id 237: order_id 23 (1 item) -> wait, id 237 is order 23? Let's check: after 236 (order 22), id 237: order_id 23? Actually id 237: "237,23,13,5,429.97,2042.3575". Yes, order 23 has 1 item? Then id 238: order 24? Let's continue.
+id 238: order 24 (1 item)
+id 239: order 25? Actually id 239: "239,24,24,8,398.54,3028.904" -> order 24? Wait, order_id is 24. Let's re-evaluate.
+
+Actually after order 22 items (id 223-236), the next is id 237: order_id 23. Then id 238: order_id 24. Then id 239: order_id 24? No, id 239 has order_id 24? Let's check: "239,24,24,8,398.54,3028.904". Yes, order_id 24. Then id 240: order_id 25? "240,25,5,1,57.39,57.39". Yes. So each id from 237 onward is a new order with 1 item? That seems odd. Let's check carefully.
+
+Wait, maybe the order_ids are not sequential in the items. Let's look at the transition from id 236 to 237:
+236: 236,22,4,8,53.13,403.788
+237: 237,23,13,5,429.97,2042.3575
+238: 238,24,48,6,347.18,1978.926
+239: 239,24,24,8,398.54,3028.904
+240: 240,25,5,1,57.39,57.39
+241: 241,25,22,4,274.63,1098.52
+242: 242,25,47,4,479.11,1916.44
+243: 243,25,42,5,414.31,1967.9725
+244: 244,25,4,5,22.45,106.6375
+245: 245,25,17,4,87.76,351.04
+246: 246,25,40,2,176.32,352.64
+247: 247,25,50,7,486.48,3235.092
+
+So order 23 has 1 item (id 237). Order 24 has 2 items (id 238,239). Order 25 has 8 items (id 240-247). Let's continue.
+
+id 248-260: order 26? Let's check:
+248: 248,26,25,1,380.29,342.261
+249: 249,26,44,3,166.73,450.171
+...
+260: 260,26,19,10,430.75,3446.0
+That's 13 items for order 26 (id 248-260).
+
+id 261-275: order 27? 
+261: 261,27,6,5,172.0,731.0
+...
+275: 275,27,11,8,455.02,3094.136
+Count: 275-261+1 = 15 items.
+
+id 276-289: order 28?
+276: 276,28,8,10,479.48,3835.84
+...
+289: 289,28,11,4,123.65,445.14
+Count: 289-276+1 = 14 items.
+
+id 290-300: order 29?
+290: 290,29,25,6,410.04,2214.216
+...
+300: 300,29,35,1,376.65,357.8175
+Count: 11 items.
+
+id 301-311: order 30?
+301: 301,30,15,3,63.55,181.1175
+...
+311: 311,30,27,5,331.37,1491.165
+Count: 11 items.
+
+id 312-316: order 31?
+312: 312,31,4,4,59.05,236.2
+...
+316: 316,31,17,3,23.94,71.82
+Count: 5 items.
+
+id 317-333: order 32?
+317: 317,32,27,5,308.35,1464.6625
+...
+333: 333,32,49,8,168.14,1277.864
+Count: 17 items.
+
+id 334-349: order 33?
+334: 334,33,44,7,29.84,198.436
+...
+349: 349,33,22,7,194.37,1292.5605
+Count: 16 items.
+
+id 350-364: order 34?
+350: 350,34,29,9,477.58,4083.309
+...
+364: 364,34,4,1,161.82,161.82
+Count: 15 items.
+
+id 365-370: order 35?
+365: 365,35,41,2,25.3,50.6
+...
+370: 370,35,5,2,380.99,761.98
+Count: 6 items.
+
+id 371-385: order 36?
+371: 371,36,15,7,84.26,501.347
+...
+385: 385,36,12,8,311.18,2116.024
+Count: 15 items.
+
+id 386-397: order 37?
+386: 386,37,12,9,467.68,3577.752
+...
+397: 397,37,12,7,303.96,1808.562
+Count: 12 items.
+
+id 398-406: order 38?
+398: 398,38,25,10,301.82,2414.56
+...
+406: 406,38,48,3,340.19,918.513
+Count: 9 items.
+
+id 407-411: order 39?
+407: 407,39,4,2,226.28,407.304
+...
+411: 411,39,16,1,321.43,289.287
+Count: 5 items.
+
+id 412-426: order 40?
+412: 412,40,47,3,128.39,365.9115
+...
+426: 426,40,39,1,444.71,422.4745
+Count: 15 items.
+
+id 427-442: order 41?
+427: 427,41,27,9,73.69,596.889
+...
+442: 442,41,7,4,98.3,373.54
+Count: 16 items.
+
+id 443: order 42? 
+443: 443,42,38,2,231.39,462.78
+Only 1 item? Let's check next:
+444: 444,43,5,5,439.44,1867.62 -> order 43.
+So order 42 has 1 item.
+
+id 444-448: order 43?
+444: 444,43,5,5,439.44,1867.62
+...
+448: 448,43,7,1,354.49,319.041
+Count: 5 items.
+
+id 449: order 44?
+449: 449,44,3,10,489.62,4553.466
+Next:
+450: 450,45,37,9,341.81,2922.4755 -> order 45.
+So order 44 has 1 item.
+
+id 450-459: order 45?
+450: 450,45,37,9,341.81,2922.4755
+...
+459: 459,45,9,3,7.78,23.34
+Count: 10 items.
+
+id 460-464: order 46?
+460: 460,46,17,7,435.6,2896.74
+...
+464: 464,46,41,6,64.02,364.914
+Count: 5 items.
+
+id 465-475: order 47?
+465: 465,47,27,6,52.24,297.768
+...
+475: 475,47,18,10,134.58,1251.594
+Count: 11 items.
+
+id 476-494: order 48?
+476: 476,48,49,10,167.23,1337.84
+...
+494: 494,48,38,6,495.32,2526.132
+Count: 19 items.
+
+id 495-509: order 49?
+495: 495,49,24,8,479.91,3263.388
+...
+509: 509,49,9,2,49.41,88.938
+Count: 15 items.
+
+id 510-515: order 50?
+510: 510,50,25,6,470.49,2399.499
+...
+515: 515,50,26,5,496.23,2108.9775
+Count: 6 items.
+
+id 516-525: order 51?
+516: 516,51,50,7,138.66,825.027
+...
+525: 525,51,39,10,422.22,3377.76
+Count: 10 items.
+
+id 526-533: order 52?
+526: 526,52,15,1,391.2,352.08
+...
+533: 533,52,32,2,12.96,23.328
+Count: 8 items.
+
+id 534-541: order 53?
+534: 534,53,32,5,173.82,738.735
+...
+541: 541,53,7,2,327.03,588.654
+Count: 8 items.
+
+id 542-556: order 54?
+542: 542,54,28,8,411.91,2800.988
+...
+556: 556,54,15,4,102.4,368.64
+Count: 15 items.
+
+id 557-564: order 55?
+557: 557,55,48,5,219.64,988.38
+...
+564: 564,55,48,7,483.1,3043.53
+Count: 8 items.
+
+id 565-579: order 56?
+565: 565,56,40,10,382.77,3368.376
+...
+579: 579,56,9,9,410.34,3323.754
+Count: 15 items.
+
+id 580-598: order 57?
+580: 580,57,30,6,283.23,1529.442
+...
+598: 598,57,20,10,423.59,3727.592
+Count: 19 items.
+
+id 599-614: order 58?
+599: 599,58,13,5,472.25,2125.125
+...
+614: 614,58,35,7,369.59,2328.417
+Count: 16 items.
+
+id 615-630: order 59?
+615: 615,59,14,6,116.11,626.994
+...
+630: 630,59,24,9,261.0,2114.1
+Count: 16 items.
+
+id 631-641: order 60?
+631: 631,60,45,7,326.27,2169.6955
+...
+641: 641,60,35,10,23.11,214.923
+Count: 11 items.
+
+id 642-652: order 61?
+642: 642,61,15,1,447.53,447.53
+...
+652: 652,61,3,6,63.0,359.1
+Count: 11 items.
+
+id 653-662: order 62?
+653: 653,62,40,10,435.91,4053.963
+...
+662: 662,62,19,5,92.18,437.855
+Count: 10 items.
+
+id 663-673: order 63?
+663: 663,63,44,2,29.03,58.06
+...
+673: 673,63,8,6,259.87,1481.259
+Count: 11 items.
+
+id 674-684: order 64?
+674: 674,64,16,10,82.09,763.437
+...
+684: 684,64,26,10,287.3,2671.89
+Count: 11 items.
+
+id 685-692: order 65?
+685: 685,65,25,7,423.83,2818.4695
+...
+692: 692,65,40,5,492.38,2338.805
+Count: 8 items.
+
+id 693-703: order 66?
+693: 693,66,12,2,327.23,654.46
+...
+703: 703,66,29,5,248.61,1180.8975
+Count: 11 items.
+
+id 704-718: order 67?
+704: 704,67,38,10,40.65,378.045
+...
+718: 718,67,2,7,303.31,2017.0115
+Count: 15 items.
+
+id 719-725: order 68?
+719: 719,68,10,8,88.83,604.044
+...
+725: 725,68,39,9,203.25,1554.8625
+Count: 7 items.
+
+id 726-742: order 69?
+726: 726,69,17,1,431.52,388.368
+...
+742: 742,69,28,4,377.83,1360.188
+Count: 17 items.
+
+id 743-746: order 70?
+743: 743,70,12,10,206.03,1648.24
+...
+746: 746,70,9,7,243.39,1448.1705
+Count: 4 items.
+
+id 747-762: order 71?
+747: 747,71,24,10,455.31,3642.48
+...
+762: 762,71,15,7,489.5,2912.525
+Count: 16 items.
+
+id 763-776: order 72?
+763: 763,72,39,7,444.13,2642.5735
+...
+776: 776,72,40,3,398.24,1075.248
+Count: 14 items.
+
+id 777-784: order 73?
+777: 777,73,25,8,186.15,1265.82
+...
+784: 784,73,48,4,81.61,293.796
+Count: 8 items.
+
+id 785-799: order 74?
+785: 785,74,35,4,409.27,1473.372
+...
+799: 799,74,3,6,499.88,2549.388
+Count: 15 items.
+
+id 800-818: order 75?
+800: 800,75,3,3,348.04,991.914
+...
+818: 818,75,19,3,234.11,667.2135
+Count: 19 items.
+
+id 819-823: order 76?
+819: 819,76,38,2,17.95,34.105
+...
+823: 823,76,47,10,167.19,1471.272
+Count: 5 items.
+
+id 824-826: order 77?
+824: 824,77,13,4,107.7,409.26
+...
+826: 826,77,41,8,278.57,2005.704
+Count: 3 items.
+
+id 827-829: order 78?
+827: 827,78,46,10,378.76,3333.088
+...
+829: 829,78,47,2,388.96,739.024
+Count: 3 items.
+
+id 830-833: order 79?
+830: 830,79,12,10,337.93,2973.784
+...
+833: 833,79,28,5,232.54,1046.43
+Count: 4 items.
+
+id 834-842: order 80?
+834: 834,80,42,5,47.35,213.075
+...
+842: 842,80,25,6,145.82,787.428
+Count: 9 items.
+
+id 843-844: order 81?
+843: 843,81,21,2,459.85,873.715
+844: 844,81,50,5,364.39,1639.755
+Count: 2 items.
+
+id 845-859: order 82?
+845: 845,82,10,7,328.05,2066.715
+...
+859: 859,82,15,5,72.47,326.115
+Count: 15 items.
+
+id 860-874: order 83?
+860: 860,83,26,2,104.65,198.835
+...
+874: 874,83,8,10,444.72,3913.536
+Count: 15 items.
+
+id 875-891: order 84?
+875: 875,84,11,4,245.48,932.824
+...
+891: 891,84,24,5,26.17,117.765
+Count: 17 items.
+
+id 892-894: order 85?
+892: 892,85,32,9,365.66,2961.846
+893: 893,85,20,7,374.79,2361.177
+894: 894,85,25,10,401.09,3529.592
+Count: 3 items.
+
+id 895-899: order 86?
+895: 895,86,36,9,275.22,2229.282
+...
+899: 899,86,40,5,262.73,1182.285
+Count: 5 items.
+
+id 900-918: order 87?
+900: 900,87,14,3,96.44,274.854
+...
+918: 918,87,34,1,254.51,241.7845
+Count: 19 items.
+
+id 919-928: order 88?
+919: 919,88,1,10,278.14,2586.702
+...
+928: 928,88,27,7,187.47,1246.6755
+Count: 10 items.
+
+id 929-934: order 89?
+929: 929,89,14,10,480.32,4466.976
+...
+934: 934,89,5,8,437.92,3328.192
+Count: 6 items.
+
+id 935-949: order 90?
+935: 935,90,49,2,114.14,205.452
+...
+949: 949,90,26,7,191.56,1139.782
+Count: 15 items.
+
+id 950-957: order 91?
+950: 950,91,2,4,440.65,1586.34
+...
+957: 957,91,22,4,245.64,884.304
+Count: 8 items.
+
+id 958-959: order 92?
+958: 958,92,48,10,46.02,368.16
+959: 959,92,50,9,54.09,413.7885
+Count: 2 items.
+
+id 960: order 93?
+960: 960,93,29,7,260.85,1552.0575
+Next:
+961: 961,93,47,2,207.48,373.464 -> order 93.
+So order 93 has 2 items? Wait, id 960 is order 93, id 961 is also order 93. Let's check:
+960: 960,93,29,7,260.85,1552.0575
+961: 961,93,47,2,207.48,373.464
+962: 962,93,1,8,143.8,977.84
+963: 963,93,50,2,299.33,538.794
+964: 964,93,46,8,80.0,544.0
+965: 965,93,41,7,56.84,338.198
+966: 966,93,28,8,234.04,1591.472
+967: 967,93,38,2,212.64,382.752
+So order 93 has 8 items (id 960-967).
+
+id 968: order 94?
+968: 968,94,3,6,304.73,1554.123
+969: 969,94,5,3,335.05,904.635
+Count: 2 items.
+
+id 970-980: order 95?
+970: 970,95,3,8,234.67,1689.624
+...
+980: 980,95,10,7,372.95,2349.585
+Count: 11 items.
+
+id 981-987: order 96?
+981: 981,96,27,5,351.42,1581.39
+...
+987: 987,96,49,1,314.18,298.471
+Count: 7 items.
+
+id 988-1005: order 97?
+988: 988,97,41,4,449.99,1709.962
+...
+1005: 1005,97,5,4,445.19,1691.722
+Count: 18 items.
+
+id 1006-1008: order 98?
+1006: 1006,98,35,7,339.69,2140.047
+1007: 1007,98,5,7,10.25,64.575
+1008: 1008,98,21,4,403.57,1533.566
+Count: 3 items.
+
+id 1009-1012: order 99?
+1009: 1009,99,45,5,312.58,1406.61
+...
+1012: 1012,99,14,7,328.06,2066.778
+Count: 4 items.
+
+id 1013-1027: order 100?
+1013: 1013,100,17,6,113.14,610.956
+...
+1027: 1027,100,29,10,104.42,918.896
+Count: 15 items.
+
+id 1028-1032: order 101?
+1028: 1028,101,6,3,314.34,895.869
+...
+1032: 1032,101,24,6,430.34,2323.836
+Count: 5 items.
+
+id 1033-1050: order 102?
+1033: 1033,102,6,8,453.73,3266.856
+...
+1050: 1050,102,49,5,176.55,794.475
+Count: 18 items.
+
+id 1051-1067: order 103?
+1051: 1051,103,32,3,426.48,1215.468
+...
+1067: 1067,103,10,4,291.07,1106.066
+Count: 17 items.
+
+id 1068: order 104?
+1068: 1068,104,29,8,7.76,55.872
+Next: 1069 is order 105. So order 104 has 1 item.
+
+id 1069-1087: order 105?
+1069: 1069,105,25,8,103.53,745.416
+...
+1087: 1087,105,3,8,436.32,3141.504
+Count: 19 items.
+
+id 1088-1092: order 106?
+1088: 1088,106,47,5,471.49,2003.8325
+...
+1092: 1092,106,44,1,104.83,94.347
+Count: 5 items.
+
+id 1093-1102: order 107?
+1093: 1093,107,35,2,199.48,379.012
+...
+1102: 1102,107,26,1,291.94,277.343
+Count: 10 items.
+
+id 1103-1110: order 108?
+1103: 1103,108,27,7,389.91,2456.433
+...
+1110: 1110,108,11,2,330.3,627.57
+Count: 8 items.
+
+id 1111-1123: order 109?
+1111: 1111,109,4,10,181.53,1597.464
+...
+1123: 1123,109,29,5,67.97,305.865
+Count: 13 items.
+
+id 1124-1143: order 110?
+1124: 1124,110,32,7,57.91,364.833
+...
+1143: 1143,110,30,6,10.68,57.672
+Count: 20 items.
+
+id 1144-1145: order 111?
+1144: 1144,111,49,7,264.54,1666.602
+1145: 1145,111,1,2,263.34,500.346
+Count: 2 items.
+
+id 1146-1153: order 112?
+1146: 1146,112,17,8,442.59,3363.684
+...
+1153: 1153,112,27,9,145.92,1247.616
+Count: 8 items.
+
+id 1154-1166: order 113?
+1154: 1154,113,50,1,109.85,109.85
+...
+1166: 1166,113,45,3,161.37,484.11
+Count: 13 items.
+
+id 1167-1176: order 114?
+1167: 1167,114,43,4,94.12,376.48
+...
+1176: 1176,114,24,3,227.12,681.36
+Count: 10 items.
+
+id 1177-1183: order 115?
+1177: 1177,115,6,4,322.14,1288.56
+...
+1183: 1183,115,3,8,464.63,3531.188
+Count: 7 items.
+
+id 1184-1188: order 116?
+1184: 1184,116,30,7,64.99,432.1835
+...
+1188: 1188,116,27,4,442.11,1768.44
+Count: 5 items.
+
+id 1189-1200: order 117?
+1189: 1189,117,9,6,150.6,858.42
+...
+1200: 1200,117,29,7,252.5,1679.125
+Count: 12 items.
+
+id 1201-1215: order 118?
+1201: 1201,118,14,8,392.53,2983.228
+...
+1215: 1215,118,2,7,283.22,1883.413
+Count: 15 items.
+
+id 1216-1229: order 119?
+1216: 1216,119,43,1,233.29,233.29
+...
+1229: 1229,119,37,8,323.01,2454.876
+Count: 14 items.
+
+id 1230-1241: order 120?
+1230: 1230,120,47,3,308.6,833.22
+...
+1241: 1241,120,42,2,152.19,273.942
+Count: 12 items.
+
+id 1242: order 121?
+1242: 1242,121,49,4,72.77,261.972
+Next: 1243 is order 122. So order 121 has 1 item.
+
+id 1243-1261: order 122?
+1243: 1243,122,40,5,302.64,1286.22
+...
+1261: 1261,122,31,7,433.3,2578.135
+Count: 19 items.
+
+id 1262-1272: order 123?
+1262: 1262,123,4,5,485.55,2063.5875
+...
+1272: 1272,123,26,9,159.1,1217.115
+Count: 11 items.
+
+id 1273-1291: order 124?
+1273: 1273,124,18,3,218.83,590.841
+...
+1291: 1291,124,19,8,323.51,2199.868
+Count: 19 items.
+
+id 1292-1301: order 125?
+1292: 1292,125,31,3,432.28,1167.156
+...
+1301: 1301,125,14,7,469.02,2790.669
+Count: 10 items.
+
+id 1302-1321: order 126?
+1302: 1302,126,41,4,82.42,329.68
+...
+1321: 1321,126,16,5,227.95,1082.7625
+Count: 20 items.
+
+id 1322-1329: order 127?
+1322: 1322,127,47,3,463.17,1389.51
+...
+1329: 1329,127,5,1,179.81,179.81
+Count: 8 items.
+
+id 1330-1332: order 128?
+1330: 1330,128,18,8,254.67,1935.492
+1331: 1331,128,21,9,359.46,3073.383
+1332: 1332,128,22,1,356.58,356.58
+Count: 3 items.
+
+id 1333-1339: order 129?
+1333: 1333,129,10,2,477.65,907.535
+...
+1339: 1339,129,6,8,331.54,2387.088
+Count: 7 items.
+
+id 1340-1352: order 130?
+1340: 1340,130,20,1,351.3,333.735
+...
+1352: 1352,130,9,10,189.14,1664.432
+Count: 13 items.
+
+id 1353-1354: order 131?
+1353: 1353,131,14,4,113.56,431.528
+1354: 1354,131,16,5,104.99,472.455
+Count: 2 items.
+
+id 1355-1364: order 132?
+1355: 1355,132,37,10,71.68,630.784
+...
+1364: 1364,132,40,2,476.43,905.217
+Count: 10 items.
+
+id 1365-1370: order 133?
+1365: 1365,133,21,8,448.56,3050.208
+...
+1370: 1370,133,10,7,328.03,1951.7785
+Count: 6 items.
+
+id 1371-1382: order 134?
+1371: 1371,134,30,10,349.17,2793.36
+...
+1382: 1382,134,22,6,197.84,1008.984
+Count: 12 items.
+
+id 1383-1385: order 135?
+1383: 1383,135,2,5,318.96,1355.58
+1384: 1384,135,36,2,284.72,512.496
+1385: 1385,135,24,5,392.19,1666.8075
+Count: 3 items.
+
+id 1386-1402: order 136?
+1386: 1386,136,8,6,14.01,71.451
+...
+1402: 1402,136,42,4,444.9,1601.64
+Count: 17 items.
+
+id 1403-1420: order 137?
+1403: 1403,137,17,8,303.92,2066.656
+...
+1420: 1420,137,49,8,29.11,197.948
+Count: 18 items.
+
+id 1421-1425: order 138?
+1421: 1421,138,34,7,137.33,817.1135
+...
+1425: 1425,138,36,3,194.46,525.042
+Count: 5 items.
+
+id 1426-1439: order 139?
+1426: 1426,139,43,5,348.14,1479.595
+...
+1439: 1439,139,20,4,295.43,1063.548
+Count: 14 items.
+
+id 1440-1457: order 140?
+1440: 1440,140,3,10,117.12,936.96
+...
+1457: 1457,140,37,4,274.33,987.588
+Count: 18 items.
+
+id 1458-1465: order 141?
+1458: 1458,141,32,10,18.68,149.44
+...
+1465: 1465,141,3,2,190.94,343.692
+Count: 8 items.
+
+id 1466-1483: order 142?
+1466: 1466,142,50,3,108.57,293.139
+...
+1483: 1483,142,42,9,421.79,3226.6935
+Count: 18 items.
+
+Now, check if any order has 0 items. All orders from 1 to 142 seem to have at least 1 item. Did we miss any order? Let's check orders that might have no items: order 21? We counted 10. Order 22:14. Order 23:1. Order 24:2. Order 25:8. Order 26:13. Order 27:15. Order 28:14. Order 29:11. Order 30:11. Order 31:5. Order 32:17. Order 33:16. Order 34:15. Order 35:6. Order 36:15. Order 37:12. Order 38:9. Order 39:5. Order 40:15. Order 41:16. Order 42:1. Order 43:5. Order 44:1. Order 45:10. Order 46:5. Order 47:11. Order 48:19. Order 49:15. Order 50:6. Order 51:10. Order 52:8. Order 53:8. Order 54:15. Order 55:8. Order 56:15. Order 57:19. Order 58:16. Order 59:16. Order 60:11. Order 61:11. Order 62:10. Order 63:11. Order 64:11. Order 65:8. Order 66:11. Order 67:15. Order 68:7. Order 69:17. Order 70:4. Order 71:16. Order 72:14. Order 73:8. Order 74:15. Order 75:19. Order 76:5. Order 77:3. Order 78:3. Order 79:4. Order 80:9. Order 81:2. Order 82:15. Order 83:15. Order 84:17. Order 85:3. Order 86:5. Order 87:19. Order 88:10. Order 89:6. Order 90:15. Order 91:8. Order 92:2. Order 93:8. Order 94:2. Order 95:11. Order 96:7. Order 97:18. Order 98:3. Order 99:4. Order 100:15. Order 101:5. Order 102:18. Order 103:17. Order 104:1. Order 105:19. Order 106:5. Order 107:10. Order 108:8. Order 109:13. Order 110:20. Order 111:2. Order 112:8. Order 113:13. Order 114:10. Order 115:7. Order 116:5. Order 117:12. Order 118:15. Order 119:14. Order 120:12. Order 121:1. Order 122:19. Order 123:11. Order 124:19. Order 125:10. Order 126:20. Order 127:8. Order 128:3. Order 129:7. Order 130:13. Order 131:2. Order 132:10. Order 133:6. Order 134:12. Order 135:3. Order 136:17. Order 137:18. Order 138:5. Order 139:14. Order 140:18. Order 141:8. Order 142:18.
+
+All orders have between 1 and 20 items inclusive. So cardinality holds.
+
+Now derivation. We need to check line_total and order.total. This is a lot. But maybe there is a violation in line_total for some row, or order.total. Let's see if we can spot any inconsistency.
+
+First, line_total formula: line_total = quantity * unit_price * (1 - discount(tier, quantity)).
+Discount depends on customer tier and quantity. We need to know the tier for each order's customer. Then for each item, compute expected line_total and compare to given line_total.
+
+Given the large number of rows, we need to find if any line_total is wrong. Perhaps there is a systematic error. Let's check a few random rows to see if they match.
+
+We need to map order_id -> customer_id -> tier.
+
+Let's create a mapping of customer tiers from customers.csv:
+1: GB, bronze
+2: JP, bronze
+3: US, bronze
+4: GB, gold
+5: OTHER, silver
+6: OTHER, bronze
+7: OTHER, bronze
+8: DE, bronze
+9: JP, gold
+10: US, silver
+11: OTHER, bronze
+12: JP, gold
+13: DE, silver
+14: GB, bronze
+15: US, gold
+16: OTHER, bronze
+17: FR, gold
+18: US, gold
+19: GB, gold
+20: FR, silver
+21: GB, bronze
+22: US, bronze
+23: DE, bronze
+24: DE, gold
+25: GB, gold
+26: OTHER, silver
+27: JP, silver
+28: DE, silver
+29: FR, bronze
+30: FR, gold
+31: JP, silver
+32: US, silver
+33: GB, silver
+34: FR, silver
+35: OTHER, gold
+36: DE, silver
+37: FR, silver
+38: OTHER, bronze
+39: GB, bronze
+40: GB, bronze
+41: FR, gold
+42: JP, gold
+43: OTHER, gold
+44: DE, bronze
+45: FR, bronze
+46: JP, silver
+47: US, silver
+48: GB, gold
+49: FR, gold
+50: DE, gold
+
+Now discount function:
+bronze: qty 1-4: 0.00, 5-9: 0.05, 10-19: 0.07
+silver: qty 1-4: 0.05, 5-9: 0.10, 10-19: 0.12
+gold: qty 1-4: 0.10, 5-9: 0.15, 10-19: 0.20
+
+Let's test some rows.
+
+Order 1: customer 1 (bronze). Items:
+1: qty 2, unit_price 464.89. Discount = 0.00. line_total = 2*464.89 = 929.78. Given: 929.78. OK.
+2: qty 2, unit_price 210.67. line_total = 421.34. Given: 421.34. OK.
+3: qty 5, unit_price 217.61. Discount bronze 5-9 = 0.05. So 5*217.61*(0.95) = 5*206.7295 = 1033.6475. Given: 1033.6475. OK.
+4: qty 3, unit_price 27.09. Discount 0.00. 3*27.09 = 81.27. OK.
+5: qty 3, unit_price 241.83. 3*241.83 = 725.49. OK.
+6: qty 5, unit_price 247.5. 5*247.5*0.95 = 5*235.125 = 1175.625. OK.
+7: qty 3, unit_price 168.18. 3*168.18 = 504.54. OK.
+8: qty 8, unit_price 313.87. 8*313.87*0.95 = 8*298.1765 = 2385.412. OK.
+9: qty 3, unit_price 121.04. 3*121.04 = 363.12. OK.
+10: qty 3, unit_price 436.03. 3*436.03 = 1308.09. OK.
+
+Sum line_total for order 1: let's sum:
+929.78 + 421.34 = 1351.12
++1033.6475 = 2384.7675
++81.27 = 2466.0375
++725.49 = 3191.5275
++1175.625 = 4367.1525
++504.54 = 4871.6925
++2385.412 = 7257.1045
++363.12 = 7620.2245
++1308.09 = 8928.3145
+
+Tax for country GB: 0.20. Order total = 8928.3145 * 1.20 = 10713.9774. Given total: 10713.9774. OK! So order 1 matches.
+
+Order 2: customer 1 (bronze). Items:
+11: qty 9, unit_price 268.17. discount 0.05. 9*268.17*0.95 = 9*254.7615 = 2292.8535. OK.
+12: qty 7, unit_price 415.95. discount 0.05. 7*415.95*0.95 = 7*395.1525 = 2766.0675. OK.
+13: qty 3, unit_price 312.44. discount 0.00. 937.32. OK.
+14: qty 4, unit_price 199.96. discount 0.00. 799.84. OK.
+15: qty 6, unit_price 150.6. discount 0.05. 6*150.6*0.95 = 6*143.07 = 858.42. OK.
+16: qty 5, unit_price 64.61. discount 0.05. 5*64.61*0.95 = 5*61.3795 = 306.8975. OK.
+17: qty 3, unit_price 321.7. discount 0.00. 965.1. OK.
+
+Sum: 2292.8535+2766.0675=5058.921
++937.32=5996.241
++799.84=6796.081
++858.42=7654.501
++306.8975=7961.3985
++965.1=8926.4985
+
+Tax GB 0.20: 8926.4985*1.20 = 10711.7982. Given: 10711.7982. OK.
+
+Order 3: customer 1 (bronze). Many items. Let's check total. Given total: 29755.9968. Sum of line_total should be 29755.9968 / 1.20 = 24796.664. Let's see if sum of given line_totals matches. We can sum the given line_totals for order 3:
+18:968.088
+19:1514.908
+20:1009.8
+21:1429.12
+22:2347.944
+23:227.79
+24:107.72
+25:215.232
+26:2876.049
+27:1751.3725
+28:695.268
+29:1823.81
+30:555.788
+31:4202.856
+32:1645.761
+33:779.665
+34:2014.38
+35:133.9975
+36:77.655
+37:419.46
+
+Let's sum:
+968.088+1514.908=2482.996
++1009.8=3492.796
++1429.12=4921.916
++2347.944=7269.86
++227.79=7497.65
++107.72=7605.37
++215.232=7820.602
++2876.049=10696.651
++1751.3725=12448.0235
++695.268=13143.2915
++1823.81=14967.1015
++555.788=15522.8895
++4202.856=19725.7455
++1645.761=21371.5065
++779.665=22151.1715
++2014.38=24165.5515
++133.9975=24299.549
++77.655=24377.204
++419.46=24796.664
+
+Yes, sum = 24796.664. *1.20 = 29755.9968. OK.
+
+So far so good. Let's check an order with a different tier.
+
+Order 8: customer 3 (US, bronze). Wait, customer 3 is US, bronze. Order 8 total: 33429.35502. Tax US = 0.08. So sum line_total = 33429.35502 / 1.08 = 30953.1065. Let's check sum of line_totals for items 88-107:
+88:2675.808
+89:605.61
+90:1060.2
+91:2932.004
+92:64.28
+93:36.11
+94:3692.403
+95:4276.977
+96:1591.972
+97:51.243
+98:206.3875
+99:1325.5445
+100:75.1545
+101:3677.355
+102:3745.242
+103:616.227
+104:659.91
+105:639.996
+106:1332.039
+107:1688.644
+
+Let's sum:
+2675.808+605.61=3281.418
++1060.2=4341.618
++2932.004=7273.622
++64.28=7337.902
++36.11=7374.012
++3692.403=11066.415
++4276.977=15343.392
++1591.972=16935.364
++51.243=16986.607
++206.3875=17192.9945
++1325.5445=18518.539
++75.1545=18593.6935
++3677.355=22271.0485
++3745.242=26016.2905
++616.227=26632.5175
++659.91=27292.4275
++639.996=27932.4235
++1332.039=29264.4625
++1688.644=30953.1065
+
+Matches. So order total derivation seems correct.
+
+Now check a gold customer. Order 10: customer 4 (GB, gold). Total: 6373.2696. Tax GB 0.20. Sum line_total = 6373.2696 / 1.20 = 5311.058. Items:
+116: qty 4, unit_price 349.0. Gold discount qty 1-4: 0.10. So 4*349*0.9 = 4*314.1 = 1256.4. OK.
+117: qty 8, unit_price 15.01. Gold discount qty 5-9: 0.15. 8*15.01*0.85 = 8*12.7585 = 102.068. OK.
+118: qty 8, unit_price 390.54. discount 0.15. 8*390.54*0.85 = 8*331.959 = 2655.672. OK.
+119: qty 3, unit_price 480.34. discount 0.10. 3*480.34*0.9 = 3*432.306 = 1296.918. OK.
+
+Sum: 1256.4+102.068=1358.468
++2655.672=4014.14
++1296.918=5311.058. *1.20 = 6373.2696. OK.
+
+Now check a silver customer. Order 11: customer 5 (OTHER, silver). Total: 10869.735. Tax other = 0.15. Sum line_total = 10869.735 / 1.15 = 9451.943478... Wait, let's compute: 10869.735 / 1.15 = 9451.943478? Actually 10869.735 / 1.15 = 9451.943478... Let's check items:
+120: qty 5, unit_price 481.06. Silver discount 5-9: 0.10. 5*481.06*0.9 = 5*432.954 = 2164.77. Given: 2044.505. Hmm, that doesn't match. Wait, let's recalc: 481.06 * 0.9 = 432.954. *5 = 2164.77. But given line_total is 2044.505. That's different. Did I misread? Let's check order 11: customer_id is 5 (tier silver). Item id 120: order_id 11, product_id 24, quantity 5, unit_price 481.06, line_total 2044.505. Let's compute with bronze discount? If bronze, discount 0.05: 5*481.06*0.95 = 5*457.007 = 2285.035. Not matching. If gold discount 0.15: 5*481.06*0.85 = 2044.505. Ah! 5*481.06 = 2405.3. *0.85 = 2044.505. So it uses gold discount (0.15) for quantity 5. But customer 5 is silver. Silver discount for qty 5 is 0.10. So this line_total is wrong? Or maybe I misidentified the customer tier. Let's check customers.csv: id 5 is "5,OTHER,silver,2022-10-09". Yes, silver. So discount should be 0.10. But line_total uses 0.15 (gold). That would be a derivation_break.
+
+But wait, maybe the line_total is computed correctly and I misread the quantity or unit_price. Let's double-check the CSV for item 120:
+120,11,24,5,481.06,2044.505
+Yes. 5 * 481.06 = 2405.3. 2405.3 * (1-0.15) = 2405.3 * 0.85 = 2044.505. So discount applied is 0.15, which is gold. But customer 5 is silver. So either the tier is wrong or the line_total is wrong. The rule says line_total = quantity * unit_price * (1 - discount(tier, quantity)). So if tier is silver, line_total should be 2405.3 * 0.9 = 2164.77. Given is 2044.505. So it's off by 120.265. This is a derivation violation.
+
+But before concluding, let's verify if there are other items for order 11 that also use wrong discount. Let's check item 121:
+121,11,46,10,81.98,655.84. Silver discount for qty 10 is 0.12. 10*81.98*0.88 = 10*72.1424 = 721.424. Given: 655.84. That's 10*81.98*0.8 = 655.84. So discount 0.20 (gold). Again gold discount used.
+
+Item 122: 122,11,1,2,443.15,797.67. Silver discount qty 2: 0.05. 2*443.15*0.95 = 2*420.9925 = 841.985. Given: 797.67. That's 2*443.15*0.9 = 797.67. Discount 0.10 (gold). Again gold.
+
+Item 123: 123,11,25,4,95.98,345.528. Silver discount qty 4: 0.05. 4*95.98*0.95 = 4*91.181 = 364.724. Given: 345.528. That's 4*95.98*0.9 = 345.528. Discount 0.10 (gold).
+
+Item 124: 124,11,27,6,26.76,136.476. Silver discount qty 6: 0.10. 6*26.76*0.9 = 6*24.084 = 144.504. Given: 136.476. That's 6*26.76*0.85 = 136.476. Discount 0.15 (gold).
+
+Item 125: 125,11,20,7,202.53,1205.0535. Silver discount qty 7: 0.10. 7*202.53*0.9 = 7*182.277 = 1275.939. Given: 1205.0535. That's 7*202.53*0.85 = 1205.0535. Discount 0.15 (gold).
+
+Item 126: 126,11,37,10,484.13,3873.04. Silver discount qty 10: 0.12. 10*484.13*0.88 = 10*426.0344 = 4260.344. Given: 3873.04. That's 10*484.13*0.8 = 3873.04. Discount 0.20 (gold).
+
+So for order 11, all items appear to use gold discount instead of silver. Let's check the order total: given total 10869.735. If we compute sum of given line_totals: 2044.505+655.84+797.67+345.528+136.476+1205.0535+3873.04 = let's sum:
+2044.505+655.84=2700.345
++797.67=3498.015
++345.528=3843.543
++136.476=3980.019
++1205.0535=5185.0725
++3873.04=9058.1125
+
+Tax for country OTHER: 0.15. Order total = 9058.1125 * 1.15 = 10416.829375. But given total is 10869.735. Hmm, that doesn't match either. Wait, maybe I missed some items? Order 11 has items 120-126 (7 items). Sum line_total = 9058.1125. *1.15 = 10416.829375. Given total is 10869.735. That's different. So order total is also inconsistent with the line_totals. But maybe I misread the order total. Let's check orders.csv for order 11:
+11,4,delivered,shipped,2022-04-04,10869.735
+Wait, order 11 is customer 4? No, order 11 has customer_id 4? Let's check orders.csv:
+10,4,delivered,shipped,2022-04-04,6373.2696
+11,4,delivered,shipped,2022-04-04,10869.735
+Yes, order 11 is customer_id 4, not 5! Oh! I made a mistake. Order 11 belongs to customer 4 (gold). Let's verify: orders.csv row 11: "11,4,delivered,shipped,2022-04-04,10869.735". So customer 4 is gold. Then discount 0.15 for qty 5 is correct for gold? Let's check gold discount table: qty 5-9: 0.15. Yes. So item 120: qty 5, gold, discount 0.15. 5*481.06*0.85 = 2044.505. Correct. Item 121: qty 10, gold, discount 0.20. 10*81.98*0.8 = 655.84. Correct. Item 122: qty 2, gold, discount 0.10. 2*443.15*0.9 = 797.67. Correct. Item 123: qty 4, gold, discount 0.10. 4*95.98*0.9 = 345.528. Correct. Item 124: qty 6, gold, discount 0.15. 6*26.76*0.85 = 136.476. Correct. Item 125: qty 7, gold, discount 0.15. 7*202.53*0.85 = 1205.0535. Correct. Item 126: qty 10, gold, discount 0.20. 10*484.13*0.8 = 3873.04. Correct.
+
+Now sum line_total = 9058.1125. Tax for customer 4 country GB: 0.20. Order total = 9058.1125 * 1.20 = 10869.735. Matches exactly. So order 11 is correct. My mistake was misreading customer_id. Good.
+
+So far, all checked orders are correct. Let's check another order where maybe the tier is different. Let's check order 15: customer 5 (silver). Order 15 total: 35840.923575. Country OTHER, tax 0.15. Sum line_total should be 35840.923575 / 1.15 = 31166.021369565... Let's check a few items.
+
+Item 147: order 15, qty 9, unit_price 477.85. Silver discount 9: 0.10. 9*477.85*0.9 = 9*430.065 = 3870.585. Given: 3870.585. OK.
+Item 148: qty 1, unit_price 460.88. Silver discount 1-4: 0.05. 1*460.88*0.95 = 437.836. Given: 437.836. OK.
+Item 149: qty 10, unit_price 200.37. Silver discount 10-19: 0.12. 10*200.37*0.88 = 10*176.3256 = 1763.256. Given: 1763.256. OK.
+Item 150: qty 9, unit_price 113.92. discount 0.10. 9*113.92*0.9 = 9*102.528 = 922.752. OK.
+Item 151: qty 9, unit_price 473.2. discount 0.10. 9*473.2*0.9 = 9*425.88 = 3832.92. OK.
+Item 152: qty 2, unit_price 312.71. discount 0.05. 2*312.71*0.95 = 2*297.0745 = 594.149. OK.
+Item 153: qty 8, unit_price 113.9. discount 0.10. 8*113.9*0.9 = 8*102.51 = 820.08. OK.
+Item 154: qty 10, unit_price 165.36. discount 0.12. 10*165.36*0.88 = 10*145.5168 = 1455.168. OK.
+Item 155: qty 9, unit_price 390.82. discount 0.10. 9*390.82*0.9 = 9*351.738 = 3165.642. OK.
+Item 156: qty 9, unit_price 164.42. discount 0.10. 9*164.42*0.9 = 9*147.978 = 1331.802. OK.
+Item 157: qty 6, unit_price 446.38. discount 0.10. 6*446.38*0.9 = 6*401.742 = 2410.452. OK.
+Item 158: qty 3, unit_price 43.33. discount 0.05. 3*43.33*0.95 = 3*41.1635 = 123.4905. OK.
+Item 159: qty 8, unit_price 195.62. discount 0.10. 8*195.62*0.9 = 8*176.058 = 1408.464. OK.
+Item 160: qty 9, unit_price 328.47. discount 0.10. 9*328.47*0.9 = 9*295.623 = 2660.607. OK.
+Item 161: qty 7, unit_price 415.27. discount 0.10. 7*415.27*0.9 = 7*373.743 = 2616.201. OK.
+Item 162: qty 8, unit_price 357.81. discount 0.10. 8*357.81*0.9 = 8*322.029 = 2576.232. OK.
+Item 163: qty 10, unit_price 133.68. discount 0.12. 10*133.68*0.88 = 10*117.6384 = 1176.384. OK.
+
+All these look correct. So order 15 is likely correct.
+
+Given the size, it's unlikely that there are many derivation errors. But we need to be sure. Let's check if there is any order with 0 items? We already checked counts, all >=1. Any order with >20? Order 3 had 20, order 8 had 20, order 110 had 20, order 126 had 20. That's allowed (max 20). So cardinality holds.
+
+Now, what about the blank prev_status? The rule says "the pair (prev_status, status) of every order lies in the allowed set". The allowed set does not include NULL. However, the CSV shows blank for prev_status for initial orders. In a database, a blank in a CSV for a VARCHAR column could be an empty string or NULL. The DDL does not have NOT NULL on prev_status. The trigger function uses ARRAY[NEW.prev_status, NEW.status] = ANY(allowed). If prev_status is NULL, the comparison returns NULL, and the IF NOT NULL is false, so no exception. But the rule as stated in natural language says the pair must lie in the allowed set. The allowed set is a four-element relation. Does it allow NULL? The description says "The legal-transition set is a four-element relation over (prev_status, status)." The four elements are listed as text arrays. It doesn't mention NULL. So if prev_status is NULL, the pair is not in the set. But is the blank in CSV representing NULL or empty string? In many CSV exports, NULL is represented as blank. However, if it's empty string, then the trigger would definitely raise an exception because ARRAY['', 'pending'] is not equal to any allowed array, and NOT false is true, so it would raise. Since the state is presented as current contents, and the trigger is presumably active, if the state is legal under the trigger, then either prev_status is NULL (which the trigger allows due to NULL handling) or the state was inserted with the trigger disabled. But the problem says "A state is LEGAL iff every one of the following holds." It lists the four rules. The status transition rule is defined as the pair lying in the allowed set. So we must enforce it as stated. If prev_status is blank (NULL), it's not in the set. So that would be a transition_break.
+
+But wait: the problem says "Status transition: the pair (prev_status, status) of every order lies in the allowed set {(pending, shipped), (shipped, delivered), (pending, cancelled), (pending, pending)}." For initial orders, prev_status is blank. Is (blank, pending) in the set? No. So it's a violation. However, maybe the blank is actually the string 'pending'? No, the CSV shows blank. But maybe the CSV omits the value for prev_status when it's the same as status? No, for initial state, the allowed pair is (pending, pending). So prev_status should be 'pending'. The CSV shows blank for those rows. That seems like a clear violation.
+
+But is there any other violation? Let's check if any order has prev_status blank but status not pending. Looking at orders.csv: all blank prev_status have status pending. So they are initial orders. The allowed initial pair is (pending, pending). So they should have prev_status = 'pending'. Since they don't, it's a transition_break.
+
+However, before finalizing, let's double-check if there is any order where prev_status is not blank and the pair is illegal. We scanned all non-blank and they are all allowed. So the only transition issue is the blank prev_status.
+
+But is there any cardinality issue? We counted open orders per customer and all are <=3. Item counts per order are between 1 and 20. So cardinality is fine.
+
+Referential integrity: all customer_ids 1-50 present. All order_ids 1-142 present in items. So fine.
+
+Derivation: we checked several orders and they match. Given the complexity, it's likely all derivations are correct. But we should check at least one more potential issue: quantity > 0 is enforced by DDL. All quantities are positive. Also, tier and status are within check constraints.
+
+One more thing: the order total derivation uses tax(country). For country "OTHER", tax is 0.15. We saw order 15 (customer 5, OTHER) total matches. Good.
+
+Now, is there any order where the total is wrong? Let's check a random one: order 20 (customer 20, FR, silver). Total: 10597.0392. Tax FR 0.20. Sum line_total = 10597.0392 / 1.20 = 8830.866. Items 202-212:
+202:307.914
+203:255.66
+204:667.29
+205:240.96
+206:416.92
+207:1995.8
+208:484.251
+209:261.423
+210:1316.7665
+211:280.31
+212:2008.224
+
+Sum:
+307.914+255.66=563.574
++667.29=1230.864
++240.96=1471.824
++416.92=1888.744
++1995.8=3884.544
++484.251=4368.795
++261.423=4630.218
++1316.7665=5946.9845
++280.31=6227.2945
++2008.224=8235.5185
+
+Wait, that's 8235.5185, not 8830.866. Did I miss items? Let's recount order 20 items. Order 20 is id 202-212? Let's check order_items.csv:
+202,20,31,6,54.02,307.914
+203,20,29,1,255.66,255.66
+204,20,19,3,222.43,667.29
+205,20,9,3,80.32,240.96
+206,20,24,1,416.92,416.92
+207,20,24,4,498.95,1995.8
+208,20,7,10,52.07,484.251
+209,20,47,10,28.11,261.423
+210,20,11,7,198.01,1316.7665
+211,20,3,1,280.31,280.31
+212,20,48,6,352.32,2008.224
+
+That's 11 items. Sum = 8235.5185. *1.20 = 9882.6222. But order total is 10597.0392. That's a discrepancy! Let's double-check the order total in orders.csv:
+20,20,cancelled,pending,2022-02-16,10597.0392
+Wait, order 20 is customer 20. But the total is 10597.0392. Let's compute sum of line_totals again carefully.
+
+202: 307.914
+203: 255.66 -> sum = 563.574
+204: 667.29 -> sum = 1230.864
+205: 240.96 -> sum = 1471.824
+206: 416.92 -> sum = 1888.744
+207: 1995.8 -> sum = 3884.544
+208: 484.251 -> sum = 4368.795
+209: 261.423 -> sum = 4630.218
+210: 1316.7665 -> sum = 5946.9845
+211: 280.31 -> sum = 6227.2945
+212: 2008.224 -> sum = 8235.5185
+
+Yes. 8235.5185 * 1.20 = 9882.6222. Given total 10597.0392. Difference is 714.417. So order 20 total is wrong? Or maybe I misidentified the tax. Customer 20 country is FR. Tax FR = 0.20. Yes.
+
+Wait, maybe some line_totals are wrong? Let's check each item's line_total for order 20.
+
+Customer 20 is tier silver (from customers.csv: 20,FR,silver). Discounts:
+- qty 6 (item 202): silver discount 0.10. 6*54.02*0.9 = 6*48.618 = 291.708. Given: 307.914. That's 6*54.02*0.95 = 307.914. So discount 0.05 (bronze) applied! Hmm.
+- qty 1 (item 203): silver discount 0.05. 1*255.66*0.95 = 242.877. Given: 255.66. That's no discount (0.00). Or maybe 255.66 is unit_price and line_total = 255.66. That would be discount 0.00 (bronze?). But silver should be 0.05.
+- qty 3 (item 204): silver discount 0.05. 3*222.43*0.95 = 3*211.3085 = 633.9255. Given: 667.29. That's 3*222.43 = 667.29. No discount. Bronze discount would be 0.00 for qty 3. So bronze discount applied.
+- qty 3 (item 205): 3*80.32 = 240.96. No discount. Bronze.
+- qty 1 (item 206): 1*416.92 = 416.92. No discount. Bronze.
+- qty 4 (item 207): silver discount 0.05. 4*498.95*0.95 = 4*474.0025 = 1896.01. Given: 1995.8. That's no discount. Bronze.
+- qty 10 (item 208): silver discount 0.12. 10*52.07*0.88 = 10*45.8216 = 458.216. Given: 484.251. That's 10*52.07*0.93? No. 484.251 / (10*52.07) = 484.251 / 520.7 = 0.93. That's not a standard discount. Wait, 484.251 = 520.7 * 0.93. But discount table doesn't have 0.07 for silver. Bronze has 0.07 for 10-19. So maybe bronze discount? 10*52.07*0.93 = 484.251. Yes, bronze discount for qty 10 is 0.07. So bronze applied.
+- qty 10 (item 209): bronze discount 0.07. 10*28.11*0.93 = 10*26.1423 = 261.423. Given: 261.423. So bronze.
+- qty 7 (item 210): silver discount 0.10. 7*198.01*0.9 = 7*178.209 = 1247.463. Given: 1316.7665. That's 7*198.01*0.95 = 1316.7665. Bronze discount 0.05.
+- qty 1 (item 211): 1*280.31 = 280.31. Bronze (no discount).
+- qty 6 (item 212): silver discount 0.10. 6*352.32*0.9 = 6*317.088 = 1902.528. Given: 2008.224. That's 6*352.32 = 2008.224. Bronze (no discount).
+
+So for order 20, all items use bronze discount (or no discount) instead of silver. Customer 20 is silver. So line_totals are computed with bronze discount. That is a derivation_break.
+
+But wait, order 20 is customer_id 20. Let's verify customers.csv row 20: "20,FR,silver,2021-09-14". Yes, silver. So the line_totals for order 20 are wrong: they use bronze discounts.
+
+Let's check the order total: sum of given line_totals = 8235.5185. Tax FR = 0.20. 8235.5185 * 1.20 = 9882.6222. But order total is 10597.0392. That's not equal to 9882.6222. So order total is also wrong. But the order total might be computed from the "correct" line_totals (with silver discount) and then tax. Let's compute correct sum with silver discount:
+
+202: 6*54.02*0.9 = 291.708
+203: 1*255.66*0.95 = 242.877
+204: 3*222.43*0.95 = 633.9255
+205: 3*80.32*0.95 = 228.912
+206: 1*416.92*0.95 = 396.074
+207: 4*498.95*0.95 = 1896.01
+208: 10*52.07*0.88 = 458.216
+209: 10*28.11*0.88 = 247.368
+210: 7*198.01*0.9 = 1247.463
+211: 1*280.31*0.95 = 266.2945
+212: 6*352.32*0.9 = 1902.528
+
+Sum:
+291.708+242.877=534.585
++633.9255=1168.5105
++228.912=1397.4225
++396.074=1793.4965
++1896.01=3689.5065
++458.216=4147.7225
++247.368=4395.0905
++1247.463=5642.5535
++266.2945=5908.848
++1902.528=7811.376
+
+7811.376 * 1.20 = 9373.6512. Not 10597.0392.
+
+Alternatively, maybe the order total is computed with bronze line_totals but a different tax? No, tax is 0.20. 8235.5185*1.2 = 9882.6222. Not 10597.0392.
+
+Wait, maybe I misread the order total. Let's check orders.csv row 20:
+20,20,cancelled,pending,2022-02-16,10597.0392
+Yes.
+
+But maybe the line_totals are correct for some other tier? Let's try gold:
+202: 6*54.02*0.85 = 275.502
+203: 1*255.66*0.9 = 230.094
+204: 3*222.43*0.9 = 600.561
+205: 3*80.32*0.9 = 216.864
+206: 1*416.92*0.9 = 375.228
+207: 4*498.95*0.9 = 1796.22
+208: 10*52.07*0.8 = 416.56
+209: 10*28.11*0.8 = 224.88
+210: 7*198.01*0.85 = 1178.1595
+211: 1*280.31*0.9 = 252.279
+212: 6*352.32*0.85 = 1796.832
+
+Sum: let's add:
+275.502+230.094=505.596
++600.561=1106.157
++216.864=1323.021
++375.228=1698.249
++1796.22=3494.469
++416.56=3911.029
++224.88=4135.909
++1178.1595=5314.0685
++252.279=5566.3475
++1796.832=7363.1795
+
+*1.20 = 8835.8154. Not 10597.0392.
+
+So the given line_totals for order 20 are bronze, but the order total 10597.0392 doesn't match bronze sum * 1.2. Let's compute sum of line_totals if we use unit_price * quantity (no discount) for all items:
+202: 324.12
+203: 255.66
+204: 667.29
+205: 240.96
+206: 416.92
+207: 1995.8
+208: 520.7
+209: 281.1
+210: 1386.07
+211: 280.31
+212: 2113.92
+
+Sum:
+324.12+255.66=579.78
++667.29=1247.07
++240.96=1488.03
++416.92=1904.95
++1995.8=3900.75
++520.7=4421.45
++281.1=4702.55
++1386.07=6088.62
++280.31=6368.93
++2113.92=8482.85
+
+8482.85 * 1.20 = 10179.42. Not 10597.0392.
+
+What if some items have discount and some don't? The given line_totals are a mix: some have bronze discount, some have no discount. Let's see:
+
+202: 307.914 = 324.12 * 0.95 (bronze 5-9 discount 0.05). But qty 6, bronze discount is 0.05. Yes.
+203: 255.66 = 255.66 * 1.0 (no discount). Bronze qty 1: 0.00.
+204: 667.29 = 667.29 * 1.0 (no discount). Bronze qty 3: 0.00.
+205: 240.96 = 240.96 * 1.0.
+206: 416.92 = 416.92 * 1.0.
+207: 1995.8 = 1995.8 * 1.0. Bronze qty 4: 0.00.
+208: 484.251 = 520.7 * 0.93. Bronze qty 10: 0.07.
+209: 261.423 = 281.1 * 0.93. Bronze qty 10: 0.07.
+210: 1316.7665 = 1386.07 * 0.95. Bronze qty 7: 0.05.
+211: 280.31 = 280.31 * 1.0.
+212: 2008.224 = 2113.92 * 0.95? Wait, 2113.92 * 0.95 = 2008.224. Yes. Bronze qty 6: 0.05.
+
+So all items use bronze discount. Sum = 8235.5185. *1.20 = 9882.6222. But order total is 10597.0392. So order total is inconsistent even with the given line_totals. That means there is a derivation break in order total. But the rule says order.total = sum(line_total) * (1+tax). So if line_totals are as given, order total must be 9882.6222. It's not. So order 20 violates derivation.
+
+But wait, maybe I misread the line_total for some item. Let's double-check item 212:
+212,20,48,6,352.32,2008.224
+6*352.32 = 2113.92. 2113.92 * 0.95 = 2008.224. Yes.
+
+Item 210:
+210,20,11,7,198.01,1316.7665
+7*198.01 = 1386.07. *0.95 = 1316.7665. Yes.
+
+Item 208:
+208,20,7,10,52.07,484.251
+10*52.07 = 520.7. *0.93 = 484.251. Yes.
+
+Item 209:
+209,20,47,10,28.11,261.423
+10*28.11 = 281.1. *0.93 = 261.423. Yes.
+
+Item 202:
+202,20,31,6,54.02,307.914
+6*54.02 = 324.12. *0.95 = 307.914. Yes.
+
+So sum is correct. Order total is wrong. But also the discount tier is wrong (should be silver). So definitely a derivation break.
+
+However, we need to be careful: is customer 20 actually silver? customers.csv: "20,FR,silver,2021-09-14". Yes.
+
+But maybe the order is for customer 20 and the line_totals are computed using the correct tier but I misread the discount table? Let's double-check discount table for silver:
+silver: qty 1-4: 0.05, 5-9: 0.10, 10-19: 0.12.
+So for qty 6, discount 0.10. Given line_total uses 0.05 (bronze). So it's wrong.
+
+Thus we have found a derivation_break. But we need to see if there are other orders like this. Let's check a few more orders for customer 20. Order 55, 56, 57, 58, 59 are also for customer 20. Let's check order 55.
+
+Order 55: customer 20. Total: 10597.0392? Wait, order 55 total is 10597.0392? Let's check orders.csv:
+55,20,cancelled,pending,2022-02-16,10597.0392
+56,20,cancelled,pending,2022-02-16,32258.5842
+57,20,delivered,shipped,2022-02-16,26304.126
+58,20,delivered,shipped,2022-02-16,23168.754
+59,20,shipped,pending,2022-02-16,23918.5758
+
+Order 55 total is also 10597.0392? Wait, order 20 total is 10597.0392. Order 55 is also 10597.0392? That seems suspicious. Let's check orders.csv row 55:
+55,20,cancelled,pending,2022-02-16,10597.0392
+Yes, same total as order 20. That suggests a possible copy-paste error. Let's check order 55 items.
+
+Order 55 items: id 557-564.
+557: 557,55,48,5,219.64,988.38
+558: 558,55,48,4,245.15,931.57
+559: 559,55,16,2,319.78,607.582
+560: 560,55,33,2,30.4,57.76
+561: 561,55,3,4,216.03,820.914
+562: 562,55,23,4,442.71,1682.298
+563: 563,55,16,8,97.06,698.832
+564: 564,55,48,7,483.1,3043.53
+
+Customer 20 is silver. Let's compute line_totals with silver discount:
+557: qty 5, unit_price 219.64. Silver discount 0.10. 5*219.64*0.9 = 5*197.676 = 988.38. Given: 988.38. OK! So this one uses silver discount.
+558: qty 4, unit_price 245.15. Silver discount 0.05. 4*245.15*0.95 = 4*232.8925 = 931.57. Given: 931.57. OK.
+559: qty 2, unit_price 319.78. Silver discount 0.05. 2*319.78*0.95 = 2*303.791 = 607.582. OK.
+560: qty 2, unit_price 30.4. Silver discount 0.05. 2*30.4*0.95 = 57.76. OK.
+561: qty 4, unit_price 216.03. Silver discount 0.05. 4*216.03*0.95 = 4*205.2285 = 820.914. OK.
+562: qty 4, unit_price 442.71. Silver discount 0.05. 4*442.71*0.95 = 4*420.5745 = 1682.298. OK.
+563: qty 8, unit_price 97.06. Silver discount 0.10. 8*97.06*0.9 = 8*87.354 = 698.832. OK.
+564: qty 7, unit_price 483.1. Silver discount 0.10. 7*483.1*0.9 = 7*434.79 = 3043.53. OK.
+
+Sum line_totals = 988.38+931.57+607.582+57.76+820.914+1682.298+698.832+3043.53 = let's sum:
+988.38+931.57=1919.95
++607.582=2527.532
++57.76=2585.292
++820.914=3406.206
++1682.298=5088.504
++698.832=5787.336
++3043.53=8830.866
+
+Tax FR 0.20: 8830.866 * 1.20 = 10597.0392. Yes! So order 55 total matches. So order 55 is correct.
+
+Now order 20 had the same total as order 55 but different items and wrong discounts. So order 20 is definitely a derivation break.
+
+But wait, order 20's total 10597.0392 equals the correct total for order 55. It seems order 20's total was copied from order 55. And order 20's line_totals use bronze discount. So it's a derivation violation.
+
+Let's check order 56 (customer 20). Total: 32258.5842. Tax 0.20. Sum line_total should be 32258.5842 / 1.20 = 26882.1535. Items 565-579:
+565: 565,56,40,10,382.77,3368.376. Silver qty 10: discount 0.12. 10*382.77*0.88 = 10*336.8376 = 3368.376. OK.
+566: 566,56,36,6,418.27,2258.658. Silver qty 6: 0.10. 6*418.27*0.9 = 6*376.443 = 2258.658. OK.
+567: 567,56,46,3,10.16,28.956. Silver qty 3: 0.05. 3*10.16*0.95 = 3*9.652 = 28.956. OK.
+568: 568,56,25,7,220.43,1388.709. Silver qty 7: 0.10. 7*220.43*0.9 = 7*198.387 = 1388.709. OK.
+569: 569,56,13,5,83.7,376.65. Silver qty 5: 0.10. 5*83.7*0.9 = 5*75.33 = 376.65. OK.
+570: 570,56,9,1,20.63,19.5985. Silver qty 1: 0.05. 1*20.63*0.95 = 19.5985. OK.
+571: 571,56,33,10,292.81,2576.728. Silver qty 10: 0.12. 10*292.81*0.88 = 10*257.6728 = 2576.728. OK.
+572: 572,56,7,8,411.25,2961.0. Silver qty 8: 0.10. 8*411.25*0.9 = 8*370.125 = 2961.0. OK.
+573: 573,56,18,6,230.89,1246.806. Silver qty 6: 0.10. 6*230.89*0.9 = 6*207.801 = 1246.806. OK.
+574: 574,56,12,8,161.04,1159.488. Silver qty 8: 0.10. 8*161.04*0.9 = 8*144.936 = 1159.488. OK.
+575: 575,56,16,5,389.46,1752.57. Silver qty 5: 0.10. 5*389.46*0.9 = 5*350.514 = 1752.57. OK.
+576: 576,56,38,6,473.34,2556.036. Silver qty 6: 0.10. 6*473.34*0.9 = 6*425. (wait 473.34*0.9 = 426.006). *6 = 2556.036. OK.
+577: 577,56,48,7,415.46,2617.398. Silver qty 7: 0.10. 7*415.46*0.9 = 7*373.914 = 2617.398. OK.
+578: 578,56,6,4,328.27,1247.426. Silver qty 4: 0.05. 4*328.27*0.95 = 4*311.8565 = 1247.426. OK.
+579: 579,56,9,9,410.34,3323.754. Silver qty 9: 0.10. 9*410.34*0.9 = 9*369.306 = 3323.754. OK.
+
+Sum line_totals: let's sum:
+3368.376+2258.658=5627.034
++28.956=5655.99
++1388.709=7044.699
++376.65=7421.349
++19.5985=7440.9475
++2576.728=10017.6755
++2961.0=12978.6755
++1246.806=14225.4815
++1159.488=15384.9695
++1752.57=17137.5395
++2556.036=19693.5755
++2617.398=22310.9735
++1247.426=23558.3995
++3323.754=26882.1535
+
+*1.20 = 32258.5842. Matches. So order 56 is correct.
+
+Thus order 20 is an outlier: its line_totals use bronze discount, and its order total doesn't match the sum of its line_totals. It's a derivation_break.
+
+But we need to be thorough: are there any other orders with wrong tier discount? Let's check another customer with silver tier and see if any order uses wrong discount. For example, customer 13 (DE, silver). Order 40 and 41. Let's check order 40.
+
+Order 40: customer 13. Total: 21134.43689. Tax DE 0.19. Sum line_total = 21134.43689 / 1.19 = 17760.031. Items 237? Wait, order 40 items: id 237 is order 23. Let's find order 40 items. Order 40 is id 237? No, earlier we saw id 237 is order 23. Let's search for order 40 in order_items. The items are not sorted by order_id after some point. Let's scan.
+
+Actually, after id 236 (order 22), id 237 is order 23, 238 order 24, 239 order 24, 240 order 25, etc. We need to find where order 40 appears. It might be later. Let's search for ",40," in the order_items. We saw id 407-411 are order 39. Then id 412-426 are order 40. Let's check order 40 items:
+
+412: 412,40,47,3,128.39,365.9115. Silver qty 3: 0.05. 3*128.39*0.95 = 3*121.9705 = 365.9115. OK.
+413: 413,40,28,6,302.58,1633.932. Silver qty 6: 0.10. 6*302.58*0.9 = 6*272.322 = 1633.932. OK.
+414: 414,40,31,1,32.83,31.1885. Silver qty 1: 0.05. 1*32.83*0.95 = 31.1885. OK.
+415: 415,40,22,3,349.38,995.733. Silver qty 3: 0.05. 3*349.38*0.95 = 3*331.911 = 995.733. OK.
+416: 416,40,44,1,447.21,424.8495. Silver qty 1: 0.05. 1*447.21*0.95 = 424.8495. OK.
+417: 417,40,19,3,423.16,1206.006. Silver qty 3: 0.05. 3*423.16*0.95 = 3*401. (423.16*0.95 = 401. (actually 423.16*0.95 = 401. (423.16 - 21.158 = 402.002? Wait, 423.16 * 0.95 = 401. (let's compute: 423.16 * 0.95 = 423.16 - 21.158 = 402.002). *3 = 1206.006. Yes. OK.
+418: 418,40,37,9,278.26,2253.906. Silver qty 9: 0.10. 9*278.26*0.9 = 9*250.434 = 2253.906. OK.
+419: 419,40,23,10,348.18,3063.984. Silver qty 10: 0.12. 10*348.18*0.88 = 10*306.3984 = 3063.984. OK.
+420: 420,40,10,10,472.36,4156.768. Silver qty 10: 0.12. 10*472.36*0.88 = 10*415.6768 = 4156.768. OK.
+421: 421,40,31,2,146.72,278.768. Silver qty 2: 0.05. 2*146.72*0.95 = 2*139.384 = 278.768. OK.
+422: 422,40,17,1,403.5,383.325. Silver qty 1: 0.05. 1*403.5*0.95 = 383.325. OK.
+423: 423,40,23,5,359.45,1617.525. Silver qty 5: 0.10. 5*359.45*0.9 = 5*323.505 = 1617.525. OK.
+424: 424,40,21,10,88.84,781.792. Silver qty 10: 0.12. 10*88.84*0.88 = 10*78.1792 = 781.792. OK.
+425: 425,40,3,3,50.48,143.868. Silver qty 3: 0.05. 3*50.48*0.95 = 3*47.956 = 143.868. OK.
+426: 426,40,39,1,444.71,422.4745. Silver qty 1: 0.05. 1*444.71*0.95 = 422.4745. OK.
+
+Sum line_totals: let's sum:
+365.9115+1633.932=1999.8435
++31.1885=2031.032
++995.733=3026.765
++424.8495=3451.6145
++1206.006=4657.6205
++2253.906=6911.5265
++3063.984=9975.5105
++4156.768=14132.2785
++278.768=14411.0465
++383.325=14794.3715
++1617.525=16411.8965
++781.792=17193.6885
++143.868=17337.5565
++422.4745=17760.031
+
+*1.19 = 21134.43689. Matches. So order 40 is correct.
+
+Thus order 20 seems to be the only obviously wrong one. But we should check if there are other orders with mismatched totals. Let's check order 55 we already did (correct). Order 56 correct. Order 57? Let's check quickly.
+
+Order 57: customer 20. Total 26304.126. Tax 0.20. Sum line_total = 26304.126 / 1.20 = 21920.105. Items 580-598. We can check a few:
+580: 283.23*6=1699.38. Silver discount 0.10 -> 1529.442. OK.
+581: 435.95*5=2179.75. Silver 0.10 -> 1961.775. OK.
+582: 192.91*1=192.91. Silver 0.05 -> 183.2645. OK.
+583: 216.64*7=1516.48. Silver 0.10 -> 1364.832. OK.
+584: 94.03*5=470.15. Silver 0.10 -> 423.135. OK.
+585: 161.35*5=806.75. Silver 0.10 -> 726.075. OK.
+586: 412.57*1=412.57. Silver 0.05 -> 391.9415. OK.
+587: 148.05*3=444.15. Silver 0.05 -> 421.9425. OK.
+588: 168.69*9=1518.21. Silver 0.10 -> 1366.389. OK.
+589: 142.7*7=998.9. Silver 0.10 -> 899.01. OK.
+590: 339.19*7=2374.33. Silver 0.10 -> 2136.897. OK.
+591: 412.04*2=824.08. Silver 0.05 -> 782.876. OK.
+592: 432.0*3=1296.0. Silver 0.05 -> 1231.2. OK.
+593: 92.97*7=650.79. Silver 0.10 -> 585.711. OK.
+594: 66.74*9=600.66. Silver 0.10 -> 540.594. OK.
+595: 68.23*6=409.38. Silver 0.10 -> 368.442. OK.
+596: 376.16*7=2633.12. Silver 0.10 -> 2369.808. OK.
+597: 319.01*3=957.03. Silver 0.05 -> 909.1785. OK.
+598: 423.59*10=4235.9. Silver 0.12 -> 3727.592. OK.
+
+Sum looks plausible. So order 57 is correct.
+
+Thus order 20 is a clear derivation violation. But we need to check if there are any other orders with similar issues. Let's check order 21 (customer 21, bronze). Order 21 total: 14786.1468. Tax GB 0.20. Sum line_total = 14786.1468 / 1.20 = 12321.789. Items 213-222:
+213: 44.19*4=176.76. Bronze 0.00 -> 176.76. OK.
+214: 240.24*4=960.96. Bronze 0.00 -> 960.96. OK.
+215: 41.71*3=125.13. Bronze 0.00 -> 125.13. OK.
+216: 128.88*5=644.4. Bronze 0.05 -> 612.18. OK.
+217: 443.06*4=1772.24. Bronze 0.00 -> 1772.24. OK.
+218: 402.5*7=2817.5. Bronze 0.05 -> 2676.625. OK.
+219: 486.61*5=2433.05. Bronze 0.05 -> 2311.3975. OK.
+220: 468.16*3=1404.48. Bronze 0.00 -> 1404.48. OK.
+221: 192.23*9=1730.07. Bronze 0.05 -> 1643.5665. OK.
+222: 380.57*10=3805.7. Bronze 0.07 -> 3539.301. OK.
+
+Sum: 176.76+960.96=1137.72
++125.13=1262.85
++612.18=1875.03
++1772.24=3647.27
++2676.625=6323.895
++2311.3975=8635.2925
++1404.48=10039.7725
++1643.5665=11683.339
++3539.301=15222.64
+
+Wait, sum is 15222.64? Let's recompute carefully:
+213: 176.76
+214: 960.96 -> 1137.72
+215: 125.13 -> 1262.85
+216: 612.18 -> 1875.03
+217: 1772.24 -> 3647.27
+218: 2676.625 -> 6323.895
+219: 2311.3975 -> 8635.2925
+220: 1404.48 -> 10039.7725
+221: 1643.5665 -> 11683.339
+222: 3539.301 -> 15222.64
+
+But expected sum is 12321.789. There's a huge discrepancy! Wait, order 21 total is 14786.1468. /1.20 = 12321.789. But sum of given line_totals is 15222.64. That's way off. Did I misread the order total? Let's check orders.csv:
+21,21,cancelled,pending,2022-03-25,14786.1468
+Yes. But sum of line_totals is 15222.64. Something is wrong. Let's double-check the line_totals for order 21.
+
+Items for order 21 (id 213-222):
+213,21,45,4,44.19,176.76
+214,21,47,4,240.24,960.96
+215,21,23,3,41.71,125.13
+216,21,17,5,128.88,612.18
+217,21,16,4,443.06,1772.24
+218,21,2,7,402.5,2676.625
+219,21,9,5,486.61,2311.3975
+220,21,39,3,468.16,1404.48
+221,21,7,9,192.23,1643.5665
+222,21,36,10,380.57,3539.301
+
+Wait, customer 21 is bronze (tier bronze). Discounts:
+- qty 4: 0.00. So 4*44.19 = 176.76. OK.
+- qty 4: 0.00. 4*240.24 = 960.96. OK.
+- qty 3: 0.00. 3*41.71 = 125.13. OK.
+- qty 5: 0.05. 5*128.88*0.95 = 5*122.436 = 612.18. OK.
+- qty 4: 0.00. 4*443.06 = 1772.24. OK.
+- qty 7: 0.05. 7*402.5*0.95 = 7*382.375 = 2676.625. OK.
+- qty 5: 0.05. 5*486.61*0.95 = 5*462.2795 = 2311.3975. OK.
+- qty 3: 0.00. 3*468.16 = 1404.48. OK.
+- qty 9: 0.05. 9*192.23*0.95 = 9*182.6185 = 1643.5665. OK.
+- qty 10: 0.07. 10*380.57*0.93 = 10*353.9301 = 3539.301. OK.
+
+Sum = 15222.64. Then order total should be 15222.64 * 1.20 = 18267.168. But given total is 14786.1468. So order total is wrong. But also maybe some line_totals are wrong? Let's check if the line_totals match the formula: they do. So the line_totals are correct for bronze. The order total is incorrect. It's a derivation_break.
+
+Wait, but maybe I misread the customer tier. Customer 21: "21,GB,bronze,2022-08-05". Yes, bronze. So line_totals are correct. Order total is wrong.
+
+But is there any possibility that the order total is computed with a different tax? Country GB, tax 0.20. 15222.64 * 1.20 = 18267.168. Not 14786.1468.
+
+What if the line_totals are supposed to be something else? Let's check if the given line_totals match a different discount. For example, if tier were gold, discounts would be higher, line_totals lower. But they match bronze. So line_totals are consistent with bronze. The order total is just wrong.
+
+But wait, maybe I misread the order_id for some items. Let's verify that items 213-222 all belong to order 21. Yes, order_id is 21. So order 21 has 10 items. Sum line_total = 15222.64. Order total = 14786.1468. That's a derivation break.
+
+However, we need to check if maybe some items belong to a different order and I miscounted. The order_items are sorted by id, and order_id generally increases but sometimes jumps back? Let's check the sequence around id 213:
+213,21,...
+214,21,...
+215,21,...
+216,21,...
+217,21,...
+218,21,...
+219,21,...
+220,21,...
+221,21,...
+222,21,...
+223,22,...
+So yes, 10 items for order 21.
+
+Thus order 21 is a derivation violation. But wait, order 21 total 14786.1468. Let's see if that matches some other order's total. Order 60 total is 14786.1468! Let's check orders.csv:
+60,21,cancelled,pending,2022-03-25,14786.1468
+Yes, order 60 has the same total as order 21. And order 60 is also customer 21. Let's check order 60 items.
+
+Order 60 items: id 631-641.
+631,60,45,7,326.27,2169.6955
+632,60,49,1,250.73,250.73
+633,60,23,10,313.98,2920.014
+634,60,26,6,432.7,2466.39
+635,60,49,3,150.11,450.33
+636,60,14,5,283.92,1348.62
+637,60,2,7,303.39,2017.5435
+638,60,31,1,115.38,115.38
+639,60,40,6,64.59,368.163
+640,60,35,10,23.11,214.923
+641,60,35,10,23.11,214.923? Wait, id 641: 641,60,35,10,23.11,214.923. Actually id 640 is 640,60,35,10,23.11,214.923. Let's re-read:
+
+631: 631,60,45,7,326.27,2169.6955
+632: 632,60,49,1,250.73,250.73
+633: 633,60,23,10,313.98,2920.014
+634: 634,60,26,6,432.7,2466.39
+635: 635,60,49,3,150.11,450.33
+636: 636,60,14,5,283.92,1348.62
+637: 637,60,2,7,303.39,2017.5435
+638: 638,60,31,1,115.38,115.38
+639: 639,60,40,6,64.59,368.163
+640: 640,60,35,10,23.11,214.923
+641: 641,60,35,10,23.11,214.923? Wait, the CSV shows:
+640,60,35,10,23.11,214.923
+641,61,15,1,447.53,447.53
+So order 60 has items 631-640 (10 items). Let's compute sum for order 60:
+631: 2169.6955
+632: 250.73
+633: 2920.014
+634: 2466.39
+635: 450.33
+636: 1348.62
+637: 2017.5435
+638: 115.38
+639: 368.163
+640: 214.923
+
+Sum:
+2169.6955+250.73=2420.4255
++2920.014=5340.4395
++2466.39=7806.8295
++450.33=8257.1595
++1348.62=9605.7795
++2017.5435=11623.323
++115.38=11738.703
++368.163=12106.866
++214.923=12321.789
+
+*1.20 = 14786.1468. Yes! So order 60's total matches its items. Order 21's total is the same as order 60's total, but order 21's items sum to 15222.64. So order 21's total is copied from order 60. And order 21's line_totals are correct for bronze. So order total is wrong. That's a derivation break.
+
+Wait, but order 21's line_totals sum to 15222.64, which is different from order 60's sum 12321.789. So order 21's total is wrong.
+
+But earlier order 20 also had total copied from order 55. So there are multiple derivation errors.
+
+Let's check order 22 (customer 22, US, bronze). Total: 19944.78336. Tax US 0.08. Sum line_total = 19944.78336 / 1.08 = 18467.392. Items 223-236:
+223: 353.35*6=2120.1. Bronze 0.05 -> 2014.095. OK.
+224: 333.27*7=2332.89. Bronze 0.05 -> 2216.2455. OK.
+225: 130.07*3=390.21. Bronze 0.00 -> 390.21. OK.
+226: 430.96*6=2585.76. Bronze 0.05 -> 2456.472. OK.
+227: 43.75*7=306.25. Bronze 0.05 -> 290.9375. OK.
+228: 205.68*4=822.72. Bronze 0.00 -> 822.72. OK.
+229: 291.33*6=1747.98. Bronze 0.05 -> 1660.581. OK.
+230: 329.68*1=329.68. Bronze 0.00 -> 329.68. OK.
+231: 59.11*8=472.88. Bronze 0.05 -> 449.236. OK.
+232: 66.99*2=133.98. Bronze 0.00 -> 133.98. OK.
+233: 81.25*3=243.75. Bronze 0.00 -> 243.75. OK.
+234: 157.85*7=1104.95. Bronze 0.05 -> 1049.7025. OK.
+235: 53.13*8=425.04. Bronze 0.05 -> 403.788. OK.
+236: 417.45*8=3339.6. Bronze 0.05 -> 3172.62. OK.
+
+Sum:
+2014.095+2216.2455=4230.3405
++390.21=4620.5505
++2456.472=7077.0225
++290.9375=7367.96
++822.72=8190.68
++1660.581=9851.261
++329.68=10180.941
++449.236=10630.177
++133.98=10764.157
++243.75=11007.907
++1049.7025=12057.6095
++403.788=12461.3975
++3172.62=15634.0175
+
+Wait, that's 15634.0175. But expected sum is 18467.392. There's a big difference. Did I miss some items? Order 22 items are id 223-236. That's 14 items. Sum is 15634.0175. But order total 19944.78336 / 1.08 = 18467.392. So sum should be 18467.392. The given sum is 15634.0175. So either some line_totals are wrong or I miscalculated.
+
+Let's recompute carefully:
+223: 2014.095
+224: 2216.2455 -> sum = 4230.3405
+225: 390.21 -> 4620.5505
+226: 2456.472 -> 7077.0225
+227: 290.9375 -> 7367.96
+228: 822.72 -> 8190.68
+229: 1660.581 -> 9851.261
+230: 329.68 -> 10180.941
+231: 449.236 -> 10630.177
+232: 133.98 -> 10764.157
+233: 243.75 -> 11007.907
+234: 1049.7025 -> 12057.6095
+235: 403.788 -> 12461.3975
+236: 3172.62 -> 15634.0175
+
+Yes. So sum is 15634.0175. *1.08 = 16884.7389. But order total is 19944.78336. That's a mismatch. So order 22 also has a derivation break? But let's check if the line_totals are correct for bronze.
+
+Item 223: qty 6, unit_price 353.35. Bronze discount 0.05. 6*353.35 = 2120.1. *0.95 = 2014.095. OK.
+Item 224: qty 7, unit_price 333.27. 7*333.27 = 2332.89

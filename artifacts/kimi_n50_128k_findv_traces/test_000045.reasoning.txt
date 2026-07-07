@@ -1,0 +1,206 @@
+We need to classify the state as LEGAL or ILLEGAL based on four checks: referential integrity, cardinality, derivation, status transition.
+
+We have three CSV files: customers (50 rows), orders (157 rows), order_items (1623 rows). We need to check each condition.
+
+First, referential integrity:
+- Every orders.customer_id must be in customers.id.
+- Every order_items.order_id must be in orders.id.
+
+Looking at orders.csv, there are customer_ids like 325, 344, 136, 547, 1038, 859, 807, etc. Customers only go up to 50. So many orders have customer_ids not in customers. That immediately breaks referential integrity.
+
+But we need to be careful: maybe some rows have empty customer_id? No, they have numbers. Let's list the customer_ids in orders that are >50 or not in 1..50.
+
+Orders:
+1: 325
+2: 1
+3: 1
+4: 344
+5: 2
+6: 2
+7: 136
+8: 3
+9: 3
+10: 3
+11: 3
+12: 3
+13: 4
+14: 4
+15: 4
+16: 5
+17: 5
+18: 5
+19: 6
+20: 6
+21: 6
+22: 7
+23: 7
+24: 7
+25: 7
+26: 7
+27: 8
+28: 8
+29: 8
+30: 8
+31: 8
+32: 547
+33: 9
+34: 9
+35: 10
+36: 11
+37: 11
+38: 11
+39: 11
+40: 12
+41: 13
+42: 13
+43: 14
+44: 14
+45: 14
+46: 14
+47: 14
+48: 15
+49: 16
+50: 17
+51: 18
+52: 18
+53: 18
+54: 18
+55: 18
+56: 19
+57: 19
+58: 19
+59: 20
+60: 20
+61: 20
+62: 20
+63: 20
+64: 21
+65: 21
+66: 21
+67: 21
+68: 22
+69: 22
+70: 22
+71: 23
+72: 23
+73: 24
+74: 25
+75: 25
+76: 25
+77: 25
+78: 25
+79: 26
+80: 26
+81: 27
+82: 27
+83: 27
+84: 28
+85: 28
+86: 28
+87: 28
+88: 29
+89: 29
+90: 29
+91: 29
+92: 30
+93: 30
+94: 30
+95: 30
+96: 31
+97: 32
+98: 32
+99: 32
+100: 33
+101: 34
+102: 34
+103: 35
+104: 35
+105: 1038
+106: 35
+107: 35
+108: 36
+109: 36
+110: 36
+111: 36
+112: 36
+113: 37
+114: 37
+115: 37
+116: 807
+117: 37
+118: 38
+119: 38
+120: 39
+121: 39
+122: 40
+123: 40
+124: 40
+125: 40
+126: 40
+127: 41
+128: 41
+129: 42
+130: 43
+131: 43
+132: 43
+133: 43
+134: 43
+135: 44
+136: 44
+137: 45
+138: 45
+139: 45
+140: 45
+141: 45
+142: 46
+143: 46
+144: 46
+145: 47
+146: 47
+147: 47
+148: 47
+149: 47
+150: 48
+151: 48
+152: 859
+153: 49
+154: 49
+155: 49
+156: 49
+157: 50
+
+So invalid customer_ids: 325, 344, 136, 547, 1038, 807, 859. Also maybe others? Let's check: 325 (order 1), 344 (order 4), 136 (order 7), 547 (order 32), 1038 (order 105), 807 (order 116), 859 (order 152). These are definitely not in customers 1-50.
+
+Thus referential integrity is broken. The state is ILLEGAL with violation "fk_break".
+
+But wait: we must also check order_items.order_id in orders.id. Let's see if any order_items refer to non-existent order_id. The order_items go up to id 1623, and order_ids range from 1 to maybe 157? Let's check the max order_id in order_items. Looking at the CSV, the order_id column goes up to 157? Let's scan: the last few rows have order_id 157. So likely all order_ids in order_items are within 1..157. But we should verify if any order_id is missing or extra. However, since FK is already broken by customer_id, we can immediately classify as fk_break.
+
+But the instructions say: "A single violation makes the state ILLEGAL". And we must output the violation. Since fk_break is present, that's the answer.
+
+But to be thorough, we should ensure that the problem expects us to check all and pick one. The JSON format: {"label": "ILLEGAL", "violation": "X"} where X is one of fk_break, cardinality_break, derivation_break, transition_break. So we just need to output fk_break.
+
+However, sometimes there might be a subtlety: maybe the empty prev_status is allowed? The trigger allows ['pending', 'pending'] and ['pending', 'shipped'] etc. For initial state, prev_status is empty? In orders.csv, some prev_status are empty (e.g., order 7: prev_status is empty, status pending). The trigger checks ARRAY[NEW.prev_status, NEW.status] = ANY (allowed). If prev_status is NULL or empty string? In the CSV, it's empty string. In PostgreSQL, an empty string is not NULL. The allowed array contains text values. The array ['', 'pending'] is not in the allowed list. So that would be a transition_break. But wait, the trigger uses ARRAY[NEW.prev_status, NEW.status] = ANY (allowed). If prev_status is empty string, then it would not match any allowed pair. However, maybe the empty string in CSV represents NULL? In SQL, NULL would be represented as empty in CSV? Usually CSV exports NULL as empty. But the problem statement says "presented as the contents of three CSV files". In CSV, NULL might be represented as empty. But in the trigger, if prev_status is NULL, then ARRAY[NULL, 'pending'] would be NULL = ANY ... which is NULL, so NOT (NULL) is NULL, and the IF condition would be NULL, which in PL/pgSQL is treated as false? Actually, in PL/pgSQL, IF NOT (NULL) THEN ... The NOT of NULL is NULL, and the IF statement treats NULL as false? Let's recall: In PL/pgSQL, the condition in IF is evaluated as a boolean expression. If the result is NULL, it is treated as false. So if prev_status is NULL, then NOT (NULL = ANY(...)) is NOT(NULL) which is NULL, so the IF body is not executed, and the trigger returns NEW. So NULL prev_status would pass. But empty string is not NULL. However, in CSV, empty field could be interpreted as NULL or empty string depending on the export. The DDL says prev_status VARCHAR(20). It doesn't have a NOT NULL constraint. So NULL is allowed. The trigger function would allow NULL prev_status because the comparison yields NULL and NOT NULL is NULL, which doesn't raise exception.
+
+But the problem says "the pair (prev_status, status) of every order lies in the allowed set". If prev_status is NULL, is that a pair? The natural language description says the pair (prev_status, status) of every order lies in the allowed set. The allowed set is a four-element relation over (prev_status, status). It doesn't include NULL. However, the trigger as written might allow NULL. But the problem says "Status transition: the pair (prev_status, status) of every order lies in the allowed set". So if prev_status is empty/NULL, that might be considered a violation of transition_break. But we need to see how the problem expects us to interpret the CSV empty values.
+
+Given that there are obvious FK violations with customer_ids like 325, 344, etc., the state is definitely illegal. The question is which violation to report. The instructions say: "if any check fails, where X is one of fk_break, cardinality_break, derivation_break, transition_break". It doesn't specify priority. But since fk_break is clearly present, we can report that.
+
+However, we should double-check if there are any orders with customer_id not in customers. Yes, many. So fk_break is correct.
+
+But let's also verify order_items.order_id in orders.id. The orders table has ids 1..157. The order_items have order_ids ranging from 1 to 157. Are there any order_ids in order_items that are not in orders? Let's check if all order_ids 1..157 appear in orders. Orders.csv has ids 1..157. So order_items refer to existing orders. But the FK from orders to customers is broken.
+
+Thus the answer is {"label":"ILLEGAL","violation":"fk_break"}.
+
+But wait, the problem might be tricky: maybe the customer_ids 325 etc. are typos but the referential integrity is defined as "every orders.customer_id occurs in customers.id". So yes, it's broken.
+
+Thus final answer: one line JSON.
+
+But before finalizing, let's consider if there is any chance that the CSV parsing of customer_id could be misread. The orders.csv header: id,customer_id,status,prev_status,order_date,total. Row 1: 1,325,cancelled,pending,2022-08-11,4650.0378. So customer_id=325. Not in customers. So definitely fk_break.
+
+Therefore output: {"label": "ILLEGAL", "violation": "fk_break"}
+
+We must ensure no extra spaces or markdown. Just one line JSON.
+
+Double-check the exact required format: {"label": "LEGAL"} or {"label": "ILLEGAL", "violation": "X"}. So we need to match that.
+
+Thus final.
