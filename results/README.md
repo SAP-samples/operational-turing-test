@@ -141,13 +141,13 @@ kimi_traces/test_NNNNNN.reasoning.txt  full chain-of-thought from message.reason
 ## Regenerate everything
 
 ```bash
-python -m src.run_ott
-python -m src.run_scaling
-python -m src.run_row_level
-python -m src.run_relational
-python -m src.run_rdbpfn
-python -m src.run_mi_probe
-python -m src.run_mi_shuffle
+python scripts/run_turing_test.py
+python scripts/run_scaling_curve.py
+python scripts/run_row_level.py
+python scripts/run_relation_only.py
+python scripts/run_rdbpfn.py
+python scripts/run_mi_probe.py
+python scripts/run_mi_shuffle_null.py
 ```
 
 Each script overwrites the corresponding CSV in this directory.
