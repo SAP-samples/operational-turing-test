@@ -225,4 +225,4 @@ local `.env` files, API keys, generated caches, or provider-specific secrets.
 
 ## License
 
-[Apache-2.0](LICENSE).
+Copyright 2026 SAP SE or an SAP affiliate company and contributors. Please see our LICENSE for copyright and license information. Detailed information including third-party components and their licensing/copyright information is available via the REUSE tool.
