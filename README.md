@@ -4,6 +4,7 @@
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue?style=flat-square)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org)
 [![Reproducible](https://img.shields.io/badge/Reproducible-45_min_single_CPU-2ea44f?style=flat-square)](REPRODUCE.md)
+[![REUSE status](https://api.reuse.software/badge/github.com/SAP-samples/operational-turing-test)](https://api.reuse.software/info/github.com/SAP-samples/operational-turing-test)
 
 #### News
 
